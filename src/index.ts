@@ -83,9 +83,15 @@ const fail = (code: number, msg: string): ExecResult => ({ stdout: "", stderr: `
 
 type Exec = (cmd: string) => Promise<ExecResult>;
 
-// ── Stored plugin-level defaults (set by createWikiPlugin) ─
-let pluginDefaults: { dim: number; metric: string; quantize: string } = {
-  dim: 1536, metric: "cosine", quantize: "float32",
+const SLUG_RE = /^[a-z0-9][a-z0-9_-]*$/;
+const validateSlug = (slug: string): string | null => {
+  if (!SLUG_RE.test(slug)) return `invalid slug '${slug}': must match ${SLUG_RE} (lowercase alphanumeric, hyphens, underscores)`;
+  return null;
+};
+
+const safeParse = (s: string | undefined): unknown[] | null => {
+  if (!s) return null;
+  try { const v = JSON.parse(s); return Array.isArray(v) ? v : null; } catch { return null; }
 };
 
 // ── Wiki Command ───────────────────────────────────────────
@@ -93,7 +99,9 @@ let pluginDefaults: { dim: number; metric: string; quantize: string } = {
 // page creations with cross-links may produce inconsistent
 // linked_from arrays. Use `wiki index --rebuild` to re-derive them.
 
-function buildWikiCommand(): Command {
+interface InitDefaults { dim: number; metric: string; quantize: string }
+
+function buildWikiCommand(defaults: InitDefaults): Command {
   return defineCommand("wiki", async (args, ctx) => {
     const exec: Exec = (cmd: string) => {
       if (!ctx.exec) return Promise.resolve({ stdout: "", stderr: "ctx.exec unavailable", exitCode: 1 } as ExecResult);
@@ -116,7 +124,7 @@ function buildWikiCommand(): Command {
     if (!sub) return fail(2, "usage: wiki <init|source|page|search|embed|lint|log|stats|index> [...]");
 
     switch (sub) {
-      case "init": return wikiInit(exec, flags);
+      case "init": return wikiInit(exec, flags, defaults);
 
       case "source": {
         const op = positional[1];
@@ -164,10 +172,10 @@ function buildWikiCommand(): Command {
 
 // ── INIT ──────────────────────────────────────────────────
 
-async function wikiInit(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
-  const dim = Number(flags.get("dim") ?? pluginDefaults.dim);
-  const metric = flags.get("metric") ?? pluginDefaults.metric;
-  const quantize = flags.get("quantize") ?? pluginDefaults.quantize;
+async function wikiInit(exec: Exec, flags: Map<string, string>, defaults: InitDefaults): Promise<ExecResult> {
+  const dim = Number(flags.get("dim") ?? defaults.dim);
+  const metric = flags.get("metric") ?? defaults.metric;
+  const quantize = flags.get("quantize") ?? defaults.quantize;
 
   const results: string[] = [];
 
@@ -273,6 +281,9 @@ async function pageCreate(exec: Exec, jsonArg: string): Promise<ExecResult> {
   if (!doc.slug || !doc.title) return fail(2, "page requires 'slug' and 'title' fields");
 
   const slug = doc.slug as string;
+  const slugErr = validateSlug(slug);
+  if (slugErr) return fail(2, slugErr);
+
   doc.links_to = doc.links_to ?? [];
   doc.linked_from = doc.linked_from ?? [];
   doc.source_ids = doc.source_ids ?? [];
@@ -358,44 +369,49 @@ async function pageDelete(exec: Exec, slug?: string): Promise<ExecResult> {
 async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promise<ExecResult> {
   if (!oldSlug || !newSlug) return fail(2, "usage: wiki page rename <old-slug> <new-slug>");
 
+  const slugErr = validateSlug(newSlug);
+  if (slugErr) return fail(2, slugErr);
+
   // Check old exists
   const oldR = await exec(dbCmd("pages", "find", { slug: oldSlug }));
   if (oldR.exitCode !== 0) return oldR;
-  const oldPages = JSON.parse(oldR.stdout) as unknown[];
-  if (oldPages.length === 0) return fail(3, `not found: ${oldSlug}`);
+  const oldPages = safeParse(oldR.stdout);
+  if (!oldPages || oldPages.length === 0) return fail(3, `not found: ${oldSlug}`);
 
   // Check new doesn't exist
   const newR = await exec(dbCmd("pages", "find", { slug: newSlug }));
-  if (newR.exitCode === 0 && JSON.parse(newR.stdout).length > 0) {
-    return fail(5, `slug already exists: ${newSlug}`);
-  }
+  const newPages = safeParse(newR.stdout);
+  if (newPages && newPages.length > 0) return fail(5, `slug already exists: ${newSlug}`);
 
-  // Update the page's own slug
-  await exec(`${dbCmd("pages", "update", { slug: oldSlug }, { $set: { slug: newSlug, updated_at: now() } })}`);
+  // Collect affected pages BEFORE mutating so we know exactly who to update.
+  // This avoids the read-after-write problem of pull-then-push.
+  const linkersR = safeParse((await exec(dbCmd("pages", "find", { links_to: { $contains: oldSlug } }) + " --project slug")).stdout) as Array<Record<string, unknown>> | null;
+  const linkerSlugs = (linkersR ?? []).map((p) => p.slug as string);
 
-  // Update links_to on pages that link TO the old slug
-  // Find pages whose links_to contains oldSlug, pull old, push new
-  const linkersR = await exec(dbCmd("pages", "find", { links_to: { $contains: oldSlug } }) + " --project slug");
-  if (linkersR.exitCode === 0 && linkersR.stdout) {
-    const linkers = JSON.parse(linkersR.stdout) as Array<Record<string, unknown>>;
-    for (const p of linkers) {
-      await exec(`${dbCmd("pages", "update", { slug: p.slug }, { $pull: { links_to: oldSlug } })}`);
-      await exec(`${dbCmd("pages", "update", { slug: p.slug }, { $push: { links_to: newSlug } })}`);
+  const targetsR = safeParse((await exec(dbCmd("pages", "find", { linked_from: { $contains: oldSlug } }) + " --project slug")).stdout) as Array<Record<string, unknown>> | null;
+  const targetSlugs = (targetsR ?? []).map((p) => p.slug as string);
+
+  // 1. Rename the page's own slug
+  const renameR = await exec(`${dbCmd("pages", "update", { slug: oldSlug }, { $set: { slug: newSlug, updated_at: now() } })}`);
+  if (renameR.exitCode !== 0) return renameR;
+
+  // 2. Update links_to: batch pull old slug, then push new slug on affected pages
+  if (linkerSlugs.length > 0) {
+    await exec(`${dbCmd("pages", "update", { links_to: { $contains: oldSlug } }, { $pull: { links_to: oldSlug } })} --many`);
+    for (const s of linkerSlugs) {
+      await exec(`${dbCmd("pages", "update", { slug: s }, { $push: { links_to: newSlug } })}`);
     }
   }
 
-  // Update linked_from on pages that the renamed page links TO
-  // Replace oldSlug with newSlug in their linked_from
-  const targetR = await exec(dbCmd("pages", "find", { linked_from: { $contains: oldSlug } }) + " --project slug");
-  if (targetR.exitCode === 0 && targetR.stdout) {
-    const targets = JSON.parse(targetR.stdout) as Array<Record<string, unknown>>;
-    for (const p of targets) {
-      await exec(`${dbCmd("pages", "update", { slug: p.slug }, { $pull: { linked_from: oldSlug } })}`);
-      await exec(`${dbCmd("pages", "update", { slug: p.slug }, { $push: { linked_from: newSlug } })}`);
+  // 3. Update linked_from: batch pull old slug, then push new slug on affected pages
+  if (targetSlugs.length > 0) {
+    await exec(`${dbCmd("pages", "update", { linked_from: { $contains: oldSlug } }, { $pull: { linked_from: oldSlug } })} --many`);
+    for (const s of targetSlugs) {
+      await exec(`${dbCmd("pages", "update", { slug: s }, { $push: { linked_from: newSlug } })}`);
     }
   }
 
-  // Re-key the vector embedding
+  // 4. Re-key vector embedding
   const vecGet = await exec(`vec get page_embeddings ${oldSlug}`);
   if (vecGet.exitCode === 0) {
     const vecData = JSON.parse(vecGet.stdout);
@@ -654,8 +670,7 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
 // ── Plugin Factory ────────────────────────────────────────
 
 export function createWikiPlugin(opts: WikiOptions = {}): Command[] {
-  // Apply plugin-level defaults for wikiInit
-  pluginDefaults = {
+  const defaults: InitDefaults = {
     dim: opts.embeddingDim ?? 1536,
     metric: opts.metric ?? "cosine",
     quantize: opts.quantize ?? "float32",
@@ -668,5 +683,5 @@ export function createWikiPlugin(opts: WikiOptions = {}): Command[] {
     salt: opts.salt,
   });
 
-  return [...dataPlugin, buildWikiCommand()] as Command[];
+  return [...dataPlugin, buildWikiCommand(defaults)] as Command[];
 }

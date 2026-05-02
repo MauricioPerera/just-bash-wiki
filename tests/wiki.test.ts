@@ -304,6 +304,13 @@ describe("wiki page rename", () => {
     expect(r.code).toBe(5);
   });
 
+  it("rejects rename to invalid slug", async () => {
+    await run(`wiki page create '{"slug":"valid","title":"V"}'`);
+    const r = await run("wiki page rename valid INVALID");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("invalid slug");
+  });
+
   it("rejects rename of non-existent slug", async () => {
     const r = await run("wiki page rename ghost new");
     expect(r.code).toBe(3);
@@ -522,6 +529,65 @@ describe("JSON injection safety", () => {
     expect(r.code).toBe(0);
     const get = json<Page[]>((await run("wiki page get special")).out)[0];
     expect(get.content).toContain("line1\nline2");
+  });
+});
+
+// ── Slug validation ───────────────────────────────────────
+
+describe("slug validation", () => {
+  beforeEach(async () => {
+    await run("wiki init --dim=4");
+  });
+
+  it("accepts valid slugs", async () => {
+    for (const slug of ["hello", "hello-world", "page_1", "a123"]) {
+      const r = await run(`wiki page create '{"slug":"${slug}","title":"T"}'`);
+      expect(r.code).toBe(0);
+    }
+  });
+
+  it("rejects uppercase slugs", async () => {
+    const r = await run(`wiki page create '{"slug":"UpperCase","title":"T"}'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("invalid slug");
+  });
+
+  it("rejects slugs with spaces", async () => {
+    const r = await run(`wiki page create '{"slug":"has space","title":"T"}'`);
+    expect(r.code).toBe(2);
+  });
+
+  it("rejects slugs starting with hyphen", async () => {
+    const r = await run(`wiki page create '{"slug":"-bad","title":"T"}'`);
+    expect(r.code).toBe(2);
+  });
+
+  it("rejects slugs with special chars", async () => {
+    const r = await run(`wiki page create '{"slug":"bad;rm","title":"T"}'`);
+    expect(r.code).toBe(2);
+  });
+});
+
+// ── Multi-instance isolation ──────────────────────────────
+
+describe("multi-instance isolation", () => {
+  it("two createWikiPlugin instances don't share defaults", async () => {
+    const bash1 = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/w1", embeddingDim: 128 }),
+    });
+    const bash2 = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/w2", embeddingDim: 256 }),
+    });
+
+    await bash1.exec("wiki init");
+    await bash2.exec("wiki init");
+
+    const s1 = JSON.parse((await bash1.exec("vec stats page_embeddings")).stdout);
+    const s2 = JSON.parse((await bash2.exec("vec stats page_embeddings")).stdout);
+    expect(s1.dim).toBe(128);
+    expect(s2.dim).toBe(256);
   });
 });
 
