@@ -1,6 +1,6 @@
 {
   "name": "just-bash-wiki",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "just-bash plugin: LLM-maintained wiki with semantic search. Implements Karpathy's LLM Wiki pattern over just-bash-data.",
   "license": "MIT",
   "author": "Mauricio Perera",
