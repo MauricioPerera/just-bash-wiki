@@ -369,8 +369,12 @@ async function pageDelete(exec: Exec, slug?: string): Promise<ExecResult> {
 async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promise<ExecResult> {
   if (!oldSlug || !newSlug) return fail(2, "usage: wiki page rename <old-slug> <new-slug>");
 
-  const slugErr = validateSlug(newSlug);
-  if (slugErr) return fail(2, slugErr);
+  // Validate both slugs. oldSlug validation supports migrating legacy data
+  // that predates the regex check — rename will fail early with a clear message.
+  const oldErr = validateSlug(oldSlug);
+  if (oldErr) return fail(2, `old slug: ${oldErr}`);
+  const newErr = validateSlug(newSlug);
+  if (newErr) return fail(2, newErr);
 
   // Check old exists
   const oldR = await exec(dbCmd("pages", "find", { slug: oldSlug }));
@@ -385,6 +389,12 @@ async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promi
 
   // Collect affected pages BEFORE mutating so we know exactly who to update.
   // This avoids the read-after-write problem of pull-then-push.
+  //
+  // SINGLE-WRITER NOTE: if another writer inserts a page with
+  // links_to: [oldSlug] between this read and the $pull below, that page
+  // will receive the $pull but miss the $push of newSlug. This is consistent
+  // with the documented single-writer assumption. Use `wiki index --rebuild`
+  // to fix any inconsistency caused by concurrent writes.
   const linkersR = safeParse((await exec(dbCmd("pages", "find", { links_to: { $contains: oldSlug } }) + " --project slug")).stdout) as Array<Record<string, unknown>> | null;
   const linkerSlugs = (linkersR ?? []).map((p) => p.slug as string);
 
@@ -411,7 +421,10 @@ async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promi
     }
   }
 
-  // 4. Re-key vector embedding
+  // 4. Re-key vector embedding.
+  // Slugs are interpolated directly into vec commands (no dbCmd wrapper).
+  // This is safe because validateSlug() above guarantees [a-z0-9_-] only.
+  // If the slug regex is ever relaxed, these must be escaped or wrapped.
   const vecGet = await exec(`vec get page_embeddings ${oldSlug}`);
   if (vecGet.exitCode === 0) {
     const vecData = JSON.parse(vecGet.stdout);

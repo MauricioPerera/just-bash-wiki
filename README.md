@@ -92,17 +92,23 @@ Creates all collections and indexes. Safe to call multiple times — skips exist
 # Add a source document
 wiki source add '{"title":"...","type":"article","content":"...","url":"...","author":"..."}'
 
-# List sources (optionally filter by type)
-wiki source list [--type=article]
+# List sources (optionally filter by type or status)
+wiki source list [--type=article] [--status=raw]
 
 # Get a source by ID
 wiki source get <id>
 
 # Count sources
 wiki source count
+
+# Update a source (MongoDB-style update operators)
+wiki source update <id> '{"$set":{"status":"processed"}}'
+
+# Delete a source (also removes its embedding)
+wiki source delete <id>
 ```
 
-**Source fields:** `title` (required), `type`, `content`, `url`, `author`, `date`. Auto-added: `ingested_at`, `status`.
+**Source fields:** `title` (required), `type`, `content`, `url`, `author`, `date`. Auto-added: `ingested_at`, `status` (default: `"raw"`).
 
 ### Pages
 
@@ -117,16 +123,21 @@ wiki page update <slug> '{"$set":{"content":"...","tags":["ai","updated"]}}'
 wiki page get <slug>
 
 # List pages with optional filters
-wiki page list [--type=concept] [--tag=ai]
+wiki page list [--type=concept] [--tag=ai] [--status=draft]
 
 # Delete a page (cleans up cross-references and embeddings)
 wiki page delete <slug>
+
+# Rename a page (updates all cross-references and re-keys embedding)
+wiki page rename <old-slug> <new-slug>
 
 # Find pages with no inbound links
 wiki page orphans
 ```
 
 **Page fields:** `slug` (required, unique), `title` (required), `type`, `content`, `tags`, `links_to`, `source_ids`. Auto-managed: `linked_from`, `created_at`, `updated_at`.
+
+**Slug format:** must match `^[a-z0-9][a-z0-9_-]*$` — lowercase alphanumeric, hyphens, and underscores. Must start with a letter or digit.
 
 **Page types:** `entity`, `concept`, `source-summary`, `comparison`, `synthesis`, `overview`, `index` (or any custom type).
 

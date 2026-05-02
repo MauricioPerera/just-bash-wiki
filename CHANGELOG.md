@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.1.3] - 2026-05-02
+
+### Fixed
+- `pageRename`: validate `oldSlug` too (support legacy data migration)
+- `pageRename`: explicit comment documenting single-writer race window between read and mutate
+- `pageRename`: comment on vec interpolation safety being guarded by slug regex
+
+### Changed
+- README: document slug format requirement (`^[a-z0-9][a-z0-9_-]*$`) in Pages section
+- README: document `wiki source update` and `wiki source delete` in Sources section
+
+## [1.1.2] - 2026-05-02
+
+### Fixed
+- `pageRename`: read affected pages BEFORE mutating, batch `$pull --many` + targeted `$push`
+- `pluginDefaults`: eliminated global mutable state, closed in `buildWikiCommand(defaults)` closure
+- `pageRename`: `safeParse()` helper prevents `JSON.parse` of empty strings
+- Slug validation (`^[a-z0-9][a-z0-9_-]*$`) on `pageCreate` and `pageRename`
+
+### Added
+- 7 new tests: slug validation suite (5), multi-instance isolation (1), rename-to-invalid-slug (1)
+
+## [1.1.1] - 2026-05-02
+
+### Added
+- Vitest test suite (49 tests) covering all commands
+- GitHub Actions CI (build + typecheck + test on push/PR)
+- CHANGELOG.md
+
 ## [1.1.0] - 2026-05-02
 
 ### Added
@@ -12,9 +41,6 @@
 - `WikiOptions.embeddingDim`, `.metric`, `.quantize` now used as defaults in `wiki init`
 - `prepublishOnly` script prevents publishing without build
 - `homepage` and `bugs` fields in package.json
-- Vitest test suite (49 tests)
-- GitHub Actions CI (build + typecheck + test)
-- CHANGELOG.md
 
 ### Fixed
 - All JSON construction migrated to `JSON.stringify` via `dbCmd()` helper, eliminating template injection bugs with special characters in slugs/values

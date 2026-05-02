@@ -311,6 +311,12 @@ describe("wiki page rename", () => {
     expect(r.err).toContain("invalid slug");
   });
 
+  it("rejects rename from invalid old slug", async () => {
+    const r = await run("wiki page rename BAD-OLD new-name");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("old slug");
+  });
+
   it("rejects rename of non-existent slug", async () => {
     const r = await run("wiki page rename ghost new");
     expect(r.code).toBe(3);
