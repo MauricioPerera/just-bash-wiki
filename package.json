@@ -31,11 +31,16 @@
   "files": [
     "dist"
   ],
+  "homepage": "https://github.com/MauricioPerera/just-bash-wiki#readme",
+  "bugs": {
+    "url": "https://github.com/MauricioPerera/just-bash-wiki/issues"
+  },
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "just-bash-data": "^1.1.1"
