@@ -1,0 +1,2 @@
+#!/usr/bin/env node
+import{a as e,b as a}from"./chunk-GTNBSMZR.js";var t={name:"clear",summary:"clear the terminal screen",usage:"clear [OPTIONS]",options:["    --help display this help and exit"]},s={name:"clear",async execute(r,c){return a(r)?e(t):{stdout:"\x1B[2J\x1B[H",stderr:"",exitCode:0}}},o={name:"clear",flags:[]};export{s as a,o as b};

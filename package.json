@@ -1,0 +1,54 @@
+{
+  "name": "just-bash-wiki",
+  "version": "1.0.0",
+  "description": "just-bash plugin: LLM-maintained wiki with semantic search. Implements Karpathy's LLM Wiki pattern over just-bash-data.",
+  "license": "MIT",
+  "author": "Mauricio Perera",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MauricioPerera/just-bash-wiki.git"
+  },
+  "keywords": [
+    "just-bash",
+    "llm-wiki",
+    "knowledge-base",
+    "rag",
+    "semantic-search",
+    "wiki",
+    "agent-shell"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "just-bash-data": "^1.1.1"
+  },
+  "peerDependencies": {
+    "just-bash": ">=2.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "just-bash": "^2.14.4",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

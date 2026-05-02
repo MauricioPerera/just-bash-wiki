@@ -1,0 +1,5 @@
+import{a as h,b as u,c as k}from"./chunk-74CEPOFO.js";var m={name:"readlink",summary:"print resolved symbolic links or canonical file names",usage:"readlink [OPTIONS] FILE...",options:["-f      canonicalize by following every symlink in every component of the given name recursively","    --help display this help and exit"]},y={name:"readlink",async execute(a,l){if(u(a))return h(m);let i=!1,n=0;for(;n<a.length&&a[n].startsWith("-");){let t=a[n];if(t==="-f"||t==="--canonicalize")i=!0,n++;else if(t==="--"){n++;break}else return k("readlink",t)}let f=a.slice(n);if(f.length===0)return{stdout:"",stderr:`readlink: missing operand
+`,exitCode:1};let r="",d=!1;for(let t of f){let s=l.fs.resolvePath(l.cwd,t);try{if(i){let e=s,c=new Set;for(;!c.has(e);){c.add(e);try{let o=await l.fs.readlink(e);if(o.startsWith("/"))e=o;else{let p=e.substring(0,e.lastIndexOf("/"))||"/";e=l.fs.resolvePath(p,o)}}catch{break}}r+=`${e}
+`}else{let e=await l.fs.readlink(s);r+=`${e}
+`}}catch{i?r+=`${s}
+`:d=!0}}return{stdout:r,stderr:"",exitCode:d?1:0}}},w={name:"readlink",flags:[{flag:"-f",type:"boolean"},{flag:"-e",type:"boolean"}],needsArgs:!0};export{y as a,w as b};

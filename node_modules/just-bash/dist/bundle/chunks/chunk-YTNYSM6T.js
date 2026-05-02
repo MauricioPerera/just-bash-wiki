@@ -1,0 +1,11 @@
+import{a as x}from"./chunk-3ZUFRYJ4.js";import{a as c,b as p}from"./chunk-A5O5YHGN.js";import{a as O}from"./chunk-IPJHKYVM.js";import{a as h,b as A,c as u}from"./chunk-74CEPOFO.js";var v={name:"timeout",summary:"run a command with a time limit",usage:"timeout [OPTION] DURATION COMMAND [ARG]...",description:`Start COMMAND, and kill it if still running after DURATION.
+
+DURATION is a number with optional suffix:
+  s - seconds (default)
+  m - minutes
+  h - hours
+  d - days`,options:["-k, --kill-after=DURATION  send KILL signal after DURATION if still running","-s, --signal=SIGNAL        specify signal to send (default: TERM)","    --preserve-status      exit with same status as COMMAND, even on timeout","    --foreground           run command in foreground","    --help                 display this help and exit"]},N={name:"timeout",async execute(s,r){if(A(s))return h(v);let i=0;for(let e=0;e<s.length;e++){let t=s[e];if(t==="--preserve-status")i=e+1;else if(t==="--foreground")i=e+1;else if(t==="-k"||t==="--kill-after")e++,i=e+1;else if(t.startsWith("--kill-after="))i=e+1;else if(t==="-s"||t==="--signal")e++,i=e+1;else if(t.startsWith("--signal="))i=e+1;else{if(t.startsWith("--")&&t!=="--")return u("timeout",t);if(t.startsWith("-")&&t.length>1&&t!=="--")if(t.startsWith("-k"))i=e+1;else if(t.startsWith("-s"))i=e+1;else return u("timeout",t);else{i=e;break}}}let n=s.slice(i);if(n.length===0)return{stdout:"",stderr:`timeout: missing operand
+`,exitCode:1};let m=n[0],d=x(m);if(d===null)return{stdout:"",stderr:`timeout: invalid time interval '${m}'
+`,exitCode:1};let o=n.slice(1);if(o.length===0)return{stdout:"",stderr:`timeout: missing operand
+`,exitCode:1};if(!r.exec)return{stdout:"",stderr:`timeout: exec not available
+`,exitCode:1};let f=new AbortController,a;try{let e=new Promise(l=>{a=c(()=>{f.abort(),l({timedOut:!0})},d)}),t=r.exec(O([o[0]]),{cwd:r.cwd,signal:f.signal,stdin:r.stdin,args:o.slice(1)}).then(l=>({timedOut:!1,result:l})),g=await Promise.race([e,t]);return g.timedOut?{stdout:"",stderr:"",exitCode:124}:g.result}finally{a!==void 0&&p(a)}}},D={name:"timeout",flags:[{flag:"-k",type:"value",valueHint:"string"},{flag:"-s",type:"value",valueHint:"string"},{flag:"--preserve-status",type:"boolean"},{flag:"--foreground",type:"boolean"}],needsArgs:!0,minArgs:2};export{N as a,D as b};
