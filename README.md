@@ -71,9 +71,17 @@ interface WikiOptions {
   authSecret?: string;     // JWT signing secret
   salt?: string;           // PBKDF2 salt prefix
   embeddingDim?: number;   // Vector dimension (default: 1536)
-  metric?: string;         // Similarity metric (default: "cosine")
-  quantize?: string;       // Quantization format (default: "float32")
+  metric?: "cosine" | "euclidean" | "dot";  // default: "cosine"
+  quantize?: "float32" | "int8";            // default: "float32"
 }
+```
+
+### Exported types
+
+The package exports TypeScript types for all data structures:
+
+```typescript
+import type { Page, Source, LogEntry, LintIssue, LintResult } from "just-bash-wiki";
 ```
 
 ## Command Reference
@@ -108,7 +116,7 @@ wiki source update <id> '{"$set":{"status":"processed"}}'
 wiki source delete <id>
 ```
 
-**Source fields:** `title` (required), `type`, `content`, `url`, `author`, `date`. Auto-added: `ingested_at`, `status` (default: `"raw"`).
+**Source fields:** `_id` (auto-generated), `title` (required), `type`, `content`, `url`, `author`, `date`. Auto-added: `ingested_at`, `status` (default: `"raw"`).
 
 ### Pages
 
@@ -135,7 +143,7 @@ wiki page rename <old-slug> <new-slug>
 wiki page orphans
 ```
 
-**Page fields:** `slug` (required, unique), `title` (required), `type`, `content`, `tags`, `links_to`, `source_ids`. Auto-managed: `linked_from`, `created_at`, `updated_at`.
+**Page fields:** `_id` (auto-generated), `slug` (required, unique), `title` (required), `type`, `content`, `tags`, `links_to`, `source_ids`. Auto-managed: `linked_from`, `created_at`, `updated_at`.
 
 **Slug format:** must match `^[a-z0-9][a-z0-9_-]*$` — lowercase alphanumeric, hyphens, and underscores. Must start with a letter or digit.
 
