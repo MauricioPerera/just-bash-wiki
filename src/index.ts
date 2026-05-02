@@ -213,21 +213,34 @@ async function pageCreate(exec: (cmd: string) => Promise<ExecResult>, jsonArg: s
   if (!doc.slug || !doc.title) return fail(2, "page requires 'slug' and 'title' fields");
 
   doc.links_to = doc.links_to ?? [];
+  doc.linked_from = doc.linked_from ?? [];
   doc.source_ids = doc.source_ids ?? [];
   doc.tags = doc.tags ?? [];
   doc.type = doc.type ?? "concept";
   doc.created_at = now();
   doc.updated_at = doc.created_at;
 
+  // Before inserting, find existing pages that already link to this slug
+  const slug = doc.slug as string;
+  const inboundR = await exec(`db pages find '{"links_to":{"$contains":"${esc(slug)}"}}'  --project slug`);
+  if (inboundR.exitCode === 0 && inboundR.stdout) {
+    const inbound = JSON.parse(inboundR.stdout) as Array<Record<string, unknown>>;
+    const existing = doc.linked_from as string[];
+    for (const p of inbound) {
+      const s = p.slug as string;
+      if (!existing.includes(s)) existing.push(s);
+    }
+  }
+
   const r = await exec(`db pages insert '${esc(JSON.stringify(doc))}'`);
   if (r.exitCode !== 0) return r;
 
   const id = JSON.parse(r.stdout)._id;
 
-  // Update inbound links on target pages
+  // Update inbound links on target pages that already exist
   const linksTo = doc.links_to as string[];
   for (const targetSlug of linksTo) {
-    await exec(`db pages update '{"slug":"${esc(targetSlug)}"}' '{"$push":{"linked_from":"${esc(doc.slug as string)}"}}'`);
+    await exec(`db pages update '{"slug":"${esc(targetSlug)}"}' '{"$push":{"linked_from":"${esc(slug)}"}}'`);
   }
 
   await appendLog(exec, "page-create", `Page created: ${doc.title}`, { slug: doc.slug, type: doc.type });
