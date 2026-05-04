@@ -490,6 +490,118 @@ describe("wiki log", () => {
   });
 });
 
+// ── Log trim ──────────────────────────────────────────────
+
+describe("wiki log trim", () => {
+  beforeEach(async () => {
+    await run("wiki init --dim=4");
+  });
+
+  it("rejects missing --keep", async () => {
+    const r = await run("wiki log trim");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("usage");
+  });
+
+  it("rejects negative --keep", async () => {
+    const r = await run("wiki log trim --keep=-1");
+    expect(r.code).toBe(2);
+  });
+
+  it("is a no-op when count <= keep", async () => {
+    // After init there's one entry; keeping 5 should remove nothing.
+    const r = await run("wiki log trim --keep=5");
+    expect(r.code).toBe(0);
+    const data = json<{ removed: number }>(r.out);
+    expect(data.removed).toBe(0);
+  });
+
+  it("removes oldest entries beyond the keep window", async () => {
+    // Add 10 custom entries in deterministic order. Together with the init
+    // entry that's 11 total.
+    for (let i = 0; i < 10; i++) {
+      await run(`wiki log add '{"type":"custom","summary":"note ${i}"}'`);
+    }
+    const before = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(before.count).toBe(11);
+
+    const trim = await run("wiki log trim --keep=3");
+    expect(trim.code).toBe(0);
+    const data = json<{ kept: number; removed: number }>(trim.out);
+    expect(data.kept).toBe(3);
+    expect(data.removed).toBe(8);
+
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(after.count).toBe(3);
+
+    // The 3 most-recent entries should remain (notes 7, 8, 9).
+    const remaining = json<LogEntry[]>(
+      (await run(`db log find '{}' --sort timestamp:-1`)).out
+    );
+    const summaries = remaining.map((e) => e.summary);
+    expect(summaries).toContain("note 9");
+    expect(summaries).toContain("note 8");
+    expect(summaries).toContain("note 7");
+  });
+
+  it("--keep=0 removes everything", async () => {
+    for (let i = 0; i < 5; i++) {
+      await run(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const r = await run("wiki log trim --keep=0");
+    expect(r.code).toBe(0);
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(after.count).toBe(0);
+  });
+});
+
+describe("WikiOptions.logMaxEntries auto-trim", () => {
+  it("does not run when not configured", async () => {
+    // Default plugin instance has no logMaxEntries.
+    await run("wiki init --dim=4");
+    for (let i = 0; i < 30; i++) {
+      await run(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    // 1 (init) + 30 = 31, no trim.
+    expect(after.count).toBe(31);
+  });
+
+  it("trims opportunistically when cap is exceeded by ≥50%", async () => {
+    const capped = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/wiki", embeddingDim: 4, logMaxEntries: 4 }),
+    });
+    await capped.exec("wiki init --dim=4");
+
+    // Need both: enough writes for the 16-call sample to fire, and enough
+    // entries to exceed cap × 1.5 = 6 at the moment the sample fires.
+    for (let i = 0; i < 40; i++) {
+      await capped.exec(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+
+    const countR = await capped.exec("db log count '{}'");
+    const total = JSON.parse(countR.stdout).count as number;
+    // At least one trim must have brought the count back down to the cap.
+    // Some growth between trims is expected; assert it never settles unbounded.
+    expect(total).toBeLessThanOrEqual(4 + 16);  // cap + one full sample window
+  });
+
+  it("does not affect writes when below cap × 1.5", async () => {
+    const capped = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/wiki", embeddingDim: 4, logMaxEntries: 50 }),
+    });
+    await capped.exec("wiki init --dim=4");
+    for (let i = 0; i < 20; i++) {
+      await capped.exec(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const total = JSON.parse((await capped.exec("db log count '{}'")).stdout).count as number;
+    // 1 init + 20 = 21, well below cap × 1.5 = 75.
+    expect(total).toBe(21);
+  });
+});
+
 // ── Stats ─────────────────────────────────────────────────
 
 describe("wiki stats", () => {

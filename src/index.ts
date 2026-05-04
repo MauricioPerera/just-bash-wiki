@@ -11,6 +11,11 @@ export interface WikiOptions extends PluginOptions {
   metric?: "cosine" | "euclidean" | "dot";
   /** Default vector quantization (default: float32). Overridden by --quantize flag on init. */
   quantize?: "float32" | "int8";
+  /** Cap on entries kept in `db log`. When exceeded by ≥50% (hysteresis), an
+   *  opportunistic trim runs after the next write, keeping the N most recent.
+   *  Disabled when omitted or 0. Manual trim is always available via
+   *  `wiki log trim --keep=N`. */
+  logMaxEntries?: number;
 }
 
 export interface Page {
@@ -94,14 +99,22 @@ const safeParse = (s: string | undefined): unknown[] | null => {
   try { const v = JSON.parse(s); return Array.isArray(v) ? v : null; } catch { return null; }
 };
 
+const safeParseAny = (s: string | undefined): unknown => {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch { return null; }
+};
+
 // ── Wiki Command ───────────────────────────────────────────
 // NOTE: this plugin assumes single-writer semantics. Concurrent
 // page creations with cross-links may produce inconsistent
 // linked_from arrays. Use `wiki index --rebuild` to re-derive them.
 
-interface InitDefaults { dim: number; metric: string; quantize: string }
+interface InitDefaults { dim: number; metric: string; quantize: string; logMaxEntries: number }
 
 function buildWikiCommand(defaults: InitDefaults): Command {
+  // Per-plugin-instance write counter for opportunistic log trim. Lives in
+  // the closure so multiple createWikiPlugin() instances don't share state.
+  let logWritesSinceTrim = 0;
   return defineCommand("wiki", async (args, ctx) => {
     const exec: Exec = (cmd: string) => {
       if (!ctx.exec) return Promise.resolve({ stdout: "", stderr: "ctx.exec unavailable", exitCode: 1 } as ExecResult);
@@ -123,50 +136,76 @@ function buildWikiCommand(defaults: InitDefaults): Command {
     const sub = positional[0];
     if (!sub) return fail(2, "usage: wiki <init|source|page|search|embed|lint|log|stats|index> [...]");
 
-    switch (sub) {
-      case "init": return wikiInit(exec, flags, defaults);
+    const dispatch = async (): Promise<ExecResult> => {
+      switch (sub) {
+        case "init": return wikiInit(exec, flags, defaults);
 
-      case "source": {
-        const op = positional[1];
-        switch (op) {
-          case "add": return sourceAdd(exec, positional.slice(2).join(" "));
-          case "list": return sourceList(exec, flags);
-          case "get": return sourceGet(exec, positional[2]);
-          case "count": return sourceCount(exec);
-          case "update": return sourceUpdate(exec, positional[2], positional.slice(3).join(" "));
-          case "delete": return sourceDelete(exec, positional[2]);
-          default: return fail(2, "usage: wiki source <add|list|get|count|update|delete> [...]");
+        case "source": {
+          const op = positional[1];
+          switch (op) {
+            case "add": return sourceAdd(exec, positional.slice(2).join(" "));
+            case "list": return sourceList(exec, flags);
+            case "get": return sourceGet(exec, positional[2]);
+            case "count": return sourceCount(exec);
+            case "update": return sourceUpdate(exec, positional[2], positional.slice(3).join(" "));
+            case "delete": return sourceDelete(exec, positional[2]);
+            default: return fail(2, "usage: wiki source <add|list|get|count|update|delete> [...]");
+          }
+        }
+
+        case "page": {
+          const op = positional[1];
+          switch (op) {
+            case "create": return pageCreate(exec, positional.slice(2).join(" "));
+            case "update": return pageUpdate(exec, positional[2], positional.slice(3).join(" "));
+            case "get": return pageGet(exec, positional[2]);
+            case "list": return pageList(exec, flags);
+            case "delete": return pageDelete(exec, positional[2]);
+            case "rename": return pageRename(exec, positional[2], positional[3]);
+            case "orphans": return pageOrphans(exec);
+            default: return fail(2, "usage: wiki page <create|update|get|list|delete|rename|orphans> [...]");
+          }
+        }
+
+        case "search": return wikiSearch(exec, positional.slice(1).join(" "), flags);
+        case "embed": return wikiEmbed(exec, positional);
+        case "lint": return wikiLint(exec);
+
+        case "log": {
+          if (positional[1] === "add") return logAdd(exec, positional.slice(2).join(" "));
+          if (positional[1] === "trim") return logTrim(exec, flags);
+          return logList(exec, flags);
+        }
+
+        case "stats": return wikiStats(exec);
+        case "index": return wikiIndex(exec, flags);
+
+        default: return fail(2, `unknown wiki command: ${sub}`);
+      }
+    };
+
+    const result = await dispatch();
+
+    // Opportunistic log auto-trim. Most subcommands write a log entry via
+    // appendLog; rather than instrument every callsite, we sample after the
+    // dispatch returns. The 16-call period bounds the per-call cost (≈one
+    // count() per 16 invocations) while still trimming promptly under load.
+    // The 1.5× hysteresis prevents trimming on every Kth call when sitting
+    // right at the cap.
+    const cap = defaults.logMaxEntries;
+    if (cap > 0) {
+      logWritesSinceTrim++;
+      if (logWritesSinceTrim >= 16) {
+        logWritesSinceTrim = 0;
+        const countR = await exec(`db log count '{}'`);
+        if (countR.exitCode === 0) {
+          const total = (safeParseAny(countR.stdout) as { count?: number } | null)?.count ?? 0;
+          if (total > Math.floor(cap * 1.5)) await trimLogToKeepN(exec, cap);
         }
       }
-
-      case "page": {
-        const op = positional[1];
-        switch (op) {
-          case "create": return pageCreate(exec, positional.slice(2).join(" "));
-          case "update": return pageUpdate(exec, positional[2], positional.slice(3).join(" "));
-          case "get": return pageGet(exec, positional[2]);
-          case "list": return pageList(exec, flags);
-          case "delete": return pageDelete(exec, positional[2]);
-          case "rename": return pageRename(exec, positional[2], positional[3]);
-          case "orphans": return pageOrphans(exec);
-          default: return fail(2, "usage: wiki page <create|update|get|list|delete|rename|orphans> [...]");
-        }
-      }
-
-      case "search": return wikiSearch(exec, positional.slice(1).join(" "), flags);
-      case "embed": return wikiEmbed(exec, positional);
-      case "lint": return wikiLint(exec);
-
-      case "log": {
-        if (positional[1] === "add") return logAdd(exec, positional.slice(2).join(" "));
-        return logList(exec, flags);
-      }
-
-      case "stats": return wikiStats(exec);
-      case "index": return wikiIndex(exec, flags);
-
-      default: return fail(2, `unknown wiki command: ${sub}`);
     }
+
+    return result;
   });
 }
 
@@ -591,6 +630,39 @@ async function logAdd(exec: Exec, jsonArg: string): Promise<ExecResult> {
   return exec(dbCmd("log", "insert", entry));
 }
 
+async function logTrim(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
+  const keepStr = flags.get("keep");
+  if (!keepStr) return fail(2, "usage: wiki log trim --keep=<N>");
+  const keep = Number(keepStr);
+  if (!Number.isInteger(keep) || keep < 0) return fail(2, "--keep must be a non-negative integer");
+
+  const removed = await trimLogToKeepN(exec, keep);
+  return ok(JSON.stringify({ kept: keep, removed }));
+}
+
+/** Delete all log entries beyond the `keep` most recent. Uses _id-based
+ *  removal (not timestamp ranges) so concurrent writes with identical
+ *  timestamps are handled correctly. Returns the number of entries removed. */
+async function trimLogToKeepN(exec: Exec, keep: number): Promise<number> {
+  // Count first so we can short-circuit when there's nothing to trim.
+  const countR = await exec(`db log count '{}'`);
+  if (countR.exitCode !== 0) return 0;
+  const total = (safeParseAny(countR.stdout) as { count?: number } | null)?.count ?? 0;
+  if (total <= keep) return 0;
+
+  // Find the _ids of everything past the keep window. Sorted oldest-first
+  // (timestamp:1) so --limit picks the right slice without --skip math.
+  const toRemove = total - keep;
+  const oldR = await exec(`db log find '{}' --sort timestamp:1 --limit ${toRemove} --project _id`);
+  if (oldR.exitCode !== 0) return 0;
+  const docs = (safeParseAny(oldR.stdout) as Array<{ _id?: string }> | null) ?? [];
+  const ids = docs.map((d) => d._id).filter((x): x is string => typeof x === "string");
+  if (ids.length === 0) return 0;
+
+  await exec(`${dbCmd("log", "remove", { _id: { $in: ids } })} --many`);
+  return ids.length;
+}
+
 async function logList(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
   const last = flags.get("last") ?? "20";
   const type = flags.get("type");
@@ -687,6 +759,7 @@ export function createWikiPlugin(opts: WikiOptions = {}): Command[] {
     dim: opts.embeddingDim ?? 1536,
     metric: opts.metric ?? "cosine",
     quantize: opts.quantize ?? "float32",
+    logMaxEntries: opts.logMaxEntries ?? 0,
   };
 
   const dataPlugin = createDataPlugin({

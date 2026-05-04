@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `wiki log trim --keep=N` — explicit log trim, removes all entries beyond the N most-recent (uses `_id`-based removal so concurrent writes with identical timestamps are handled correctly) (#9)
+- `WikiOptions.logMaxEntries` — when set, the plugin samples log size every 16 commands and opportunistically trims back to the cap when the count exceeds 1.5× the cap (#9)
+- `safeParseAny` helper for tolerant `JSON.parse` of tool stdout
+
 ## [1.1.3] - 2026-05-02
 
 ### Fixed
