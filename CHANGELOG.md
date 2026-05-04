@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- `wikiInit`: errors from `vec create` are now propagated instead of being silently swallowed (#1)
+- `pageUpdate` / `sourceUpdate`: return exit 3 (`not found`) when the slug/id doesn't match, instead of logging a misleading "updated" entry (#2)
+- `wikiSearch`: parse and revalidate the vector argument with `JSON.parse` + `Array.isArray` so malformed input fails with a clear usage error rather than a `vec`-internal one (#3)
+- `wikiSearch`: unknown `--type` values now fail loudly instead of silently falling through to `pages` (#6)
+- `wikiStats`, `wikiLint`, `wikiIndex`, `pageOrphans`: replaced direct `JSON.parse(r.stdout)` calls with a tolerant `safeParseAny` helper to prevent uncaught throws on empty/invalid stdout (#4)
+- `wikiEmbed`: `--meta` is now read from the parsed flag map, so it works regardless of position (`--meta=...` before vector no longer drops silently) (#5)
+- `wikiEmbed`: rejects unknown embed targets explicitly (`page` / `source` only)
+
+### Added
+- `Page.status?: string` — documents the lifecycle field already used by `wiki page list --status=...` (#11)
+- 12 new tests covering all the above plus `wiki index --rebuild` correctness with intentionally corrupted `linked_from` (#10)
+
 ## [1.1.3] - 2026-05-02
 
 ### Fixed
