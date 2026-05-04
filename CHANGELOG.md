@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `--limit` / `--offset` on `wiki source list`, `wiki page list`, `wiki page orphans`, and the default `wiki index` view (#7). Invalid values (negative, non-integer) are silently dropped — the call still succeeds with the unfiltered behaviour.
+- Lint now flags pages whose `content` field is missing entirely, in addition to `null` / `""` (previously only flagged when missing OR pure whitespace, but at the cost of streaming every page body through stdout).
+
+### Changed
+- `wiki page orphans` now pushes the `linked_from` empty-check into the underlying `db pages find` query (`$size: 0` plus a `null` fallback for legacy data) instead of loading every page and filtering in JS (#7). Order-of-magnitude reduction in stdout volume on large wikis.
+- `wiki lint` no longer projects the full `content` field for every page (#8). Empty-content detection is delegated to a separate targeted query (`$exists: false` / `null` / `""`). Whitespace-only content is no longer flagged — accepted tradeoff for capping the lint payload at metadata size.
+- `pageCreate` now initialises `content` to `""` when omitted, so the field is always present (matching `Page.content: string`).
+
 ## [1.1.3] - 2026-05-02
 
 ### Fixed
