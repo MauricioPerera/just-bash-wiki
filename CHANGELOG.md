@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.1] - 2026-05-04
+
+### Documentation
+- README: document `wiki embed --meta='<json>'` (already in code since 1.2.0).
+- README: list `Page.status?` and add explicit defaults for every other page field.
+- README: clarify that `empty-content` lint no longer flags pure-whitespace content.
+- README: rephrase search-results wording as metric-aware (cosine / euclidean / dot).
+- README: note the `title`-unique index on the `sources` collection.
+- CHANGELOG: corrected v1.2.0 test count (32 → 29 new, 86 total) and added the absolute baseline (57 in v1.1.3).
+
+No code changes. Republished so the README on npm matches the corrected version on GitHub.
+
 ## [1.2.0] - 2026-05-04
 
 ### Added
