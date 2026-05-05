@@ -622,3 +622,116 @@ describe("edge cases", () => {
     expect(r.code).toBe(2);
   });
 });
+
+// ── Bug-fix regressions ───────────────────────────────────
+
+describe("pageUpdate not-found rejection (#2)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("returns exit 3 when slug doesn't exist", async () => {
+    const r = await run(`wiki page update ghost '{"$set":{"content":"x"}}'`);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("not found");
+  });
+
+  it("does not log a misleading entry on no-op update", async () => {
+    await run(`wiki page update ghost '{"$set":{"content":"x"}}'`);
+    const log = json<LogEntry[]>((await run("wiki log --last=20")).out);
+    expect(log.some((e) => e.summary?.includes?.("Page updated: ghost"))).toBe(false);
+  });
+
+  it("succeeds when slug exists", async () => {
+    await run(`wiki page create '{"slug":"real","title":"Real"}'`);
+    const r = await run(`wiki page update real '{"$set":{"content":"new"}}'`);
+    expect(r.code).toBe(0);
+  });
+});
+
+describe("sourceUpdate not-found rejection (#2)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("returns exit 3 when id doesn't exist", async () => {
+    const r = await run(`wiki source update fake-id '{"$set":{"status":"processed"}}'`);
+    expect(r.code).toBe(3);
+  });
+});
+
+describe("wikiSearch validation (#3, #6)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("rejects malformed vector json", async () => {
+    const r = await run(`wiki search 'not-an-array'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("invalid vector json");
+  });
+
+  it("rejects vectors that are not arrays", async () => {
+    const r = await run(`wiki search '{"x":1}'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("must be a JSON array");
+  });
+
+  it("rejects unknown --type values", async () => {
+    const r = await run(`wiki search '[1,2,3,4]' --type=bogus`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown --type");
+  });
+
+  it("accepts valid --type values", async () => {
+    for (const t of ["pages", "sources", "all"]) {
+      const r = await run(`wiki search '[1,0,0,0]' --k=1 --type=${t}`);
+      expect(r.code).toBe(0);
+    }
+  });
+});
+
+describe("wikiEmbed --meta position (#5)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("accepts --meta before the vector", async () => {
+    await run(`wiki page create '{"slug":"x","title":"X"}'`);
+    const r = await run(`wiki embed --meta='{"k":"v"}' page x '[1,0,0,0]'`);
+    expect(r.code).toBe(0);
+    const got = json<{ metadata?: Record<string, string> }>((await run("vec get page_embeddings x")).out);
+    expect(got.metadata?.k).toBe("v");
+  });
+
+  it("accepts --meta after the vector (legacy position)", async () => {
+    await run(`wiki page create '{"slug":"y","title":"Y"}'`);
+    const r = await run(`wiki embed page y '[1,0,0,0]' --meta='{"k":"v2"}'`);
+    expect(r.code).toBe(0);
+    const got = json<{ metadata?: Record<string, string> }>((await run("vec get page_embeddings y")).out);
+    expect(got.metadata?.k).toBe("v2");
+  });
+
+  it("rejects unknown embed target", async () => {
+    const r = await run(`wiki embed bogus xx '[1,0,0,0]'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown embed target");
+  });
+});
+
+describe("wiki index --rebuild repair (#10)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("rebuilds linked_from to match the inverse of links_to", async () => {
+    await run(`wiki page create '{"slug":"a","title":"A","links_to":["b"]}'`);
+    await run(`wiki page create '{"slug":"b","title":"B"}'`);
+    await run(`wiki page create '{"slug":"c","title":"C","links_to":["b"]}'`);
+
+    // Corrupt linked_from on b (extra ghost), and on a (false inbound).
+    await run(`db pages update '{"slug":"b"}' '{"$set":{"linked_from":["ghost","a"]}}'`);
+    await run(`db pages update '{"slug":"a"}' '{"$set":{"linked_from":["b"]}}'`);
+
+    const r = await run("wiki index --rebuild");
+    expect(r.code).toBe(0);
+
+    const a = json<Page[]>((await run("wiki page get a")).out)[0];
+    const b = json<Page[]>((await run("wiki page get b")).out)[0];
+    const c = json<Page[]>((await run("wiki page get c")).out)[0];
+
+    expect(a.linked_from).toEqual([]);
+    expect((b.linked_from ?? []).slice().sort()).toEqual(["a", "c"]);
+    expect(c.linked_from).toEqual([]);
+  });
+});

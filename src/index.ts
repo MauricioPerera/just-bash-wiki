@@ -23,6 +23,10 @@ export interface Page {
   links_to: string[];
   linked_from: string[];
   source_ids: string[];
+  /** Free-form page lifecycle marker (e.g. "draft", "published"). Optional; not
+   *  set automatically by `pageCreate` — callers manage it. Filterable via
+   *  `wiki page list --status=<value>`. */
+  status?: string;
   created_at: string;
   updated_at: string;
 }
@@ -94,6 +98,13 @@ const safeParse = (s: string | undefined): unknown[] | null => {
   try { const v = JSON.parse(s); return Array.isArray(v) ? v : null; } catch { return null; }
 };
 
+/** Parse any JSON value tolerantly. Returns null on empty/invalid input
+ *  so callers can guard a single nullish check instead of try/catching. */
+const safeParseAny = (s: string | undefined): unknown => {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch { return null; }
+};
+
 // ── Wiki Command ───────────────────────────────────────────
 // NOTE: this plugin assumes single-writer semantics. Concurrent
 // page creations with cross-links may produce inconsistent
@@ -154,7 +165,7 @@ function buildWikiCommand(defaults: InitDefaults): Command {
       }
 
       case "search": return wikiSearch(exec, positional.slice(1).join(" "), flags);
-      case "embed": return wikiEmbed(exec, positional);
+      case "embed": return wikiEmbed(exec, positional, flags);
       case "lint": return wikiLint(exec);
 
       case "log": {
@@ -198,15 +209,17 @@ async function wikiInit(exec: Exec, flags: Map<string, string>, defaults: InitDe
   await seedIfEmpty("pages", [`db pages index create slug --unique`, `db pages index create type`]);
   await seedIfEmpty("log", []);
 
-  const vecCreate = async (coll: string) => {
+  const vecCreate = async (coll: string): Promise<ExecResult | null> => {
     const r = await exec(`vec create ${coll} --dim ${dim} --metric ${metric} --quantize ${quantize}`);
-    if (r.exitCode === 0) results.push(`vec ${coll}: created`);
-    else if (r.stderr.includes("collection exists")) results.push(`vec ${coll}: exists`);
-    else return fail(r.exitCode, r.stderr.trim());
+    if (r.exitCode === 0) { results.push(`vec ${coll}: created`); return null; }
+    if (r.stderr.includes("collection exists")) { results.push(`vec ${coll}: exists`); return null; }
+    return fail(r.exitCode, r.stderr.trim());
   };
 
-  await vecCreate("page_embeddings");
-  await vecCreate("source_embeddings");
+  const e1 = await vecCreate("page_embeddings");
+  if (e1) return e1;
+  const e2 = await vecCreate("source_embeddings");
+  if (e2) return e2;
   await appendLog(exec, "init", "Wiki initialized");
 
   return ok(JSON.stringify({ initialized: true, collections: results }));
@@ -256,6 +269,9 @@ async function sourceUpdate(exec: Exec, id?: string, jsonArg?: string): Promise<
 
   const r = await exec(`${dbCmd("sources", "update", { _id: id }, update)}`);
   if (r.exitCode !== 0) return r;
+  let matched = 0;
+  try { matched = (JSON.parse(r.stdout) as { matched?: number }).matched ?? 0; } catch { /* tolerate */ }
+  if (matched === 0) return fail(3, `not found: ${id}`);
   await appendLog(exec, "source-update", `Source updated: ${id}`, { source_id: id });
   return r;
 }
@@ -331,6 +347,11 @@ async function pageUpdate(exec: Exec, slug?: string, jsonArg?: string): Promise<
 
   const r = await exec(`${dbCmd("pages", "update", { slug }, update)}`);
   if (r.exitCode !== 0) return r;
+  // Reject silent no-ops: db returns {matched, modified}; if nothing matched
+  // the slug doesn't exist and we shouldn't write a misleading log entry.
+  let matched = 0;
+  try { matched = (JSON.parse(r.stdout) as { matched?: number }).matched ?? 0; } catch { /* tolerate */ }
+  if (matched === 0) return fail(3, `not found: ${slug}`);
   await appendLog(exec, "page-update", `Page updated: ${slug}`, { slug });
   return r;
 }
@@ -440,7 +461,7 @@ async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promi
 async function pageOrphans(exec: Exec): Promise<ExecResult> {
   const r = await exec(`db pages find '{}' --project slug,title,type,linked_from,links_to`);
   if (r.exitCode !== 0) return r;
-  const pages = JSON.parse(r.stdout) as Array<Record<string, unknown>>;
+  const pages = (safeParseAny(r.stdout) as Array<Record<string, unknown>> | null) ?? [];
   const orphans = pages.filter((p) => {
     const lf = p.linked_from as string[] | undefined;
     return !lf || lf.length === 0;
@@ -455,25 +476,43 @@ async function wikiSearch(exec: Exec, vectorArg: string, flags: Map<string, stri
   const k = flags.get("k") ?? "10";
   const searchType = flags.get("type");
 
+  // Whitelist accepted --type values; unknown values must fail loudly,
+  // not silently fall through to pages.
+  const VALID_TYPES = new Set([undefined, "pages", "sources", "all"]);
+  if (!VALID_TYPES.has(searchType)) {
+    return fail(2, `unknown --type: ${searchType} (expected pages|sources|all)`);
+  }
+
+  // Parse and revalidate the vector at the wiki layer so users get a clear
+  // usage error instead of a vec-internal one for malformed input. JSON.stringify
+  // also strips any garbage that survived the bash quoting.
+  let vector: unknown;
+  try { vector = JSON.parse(vectorArg); } catch { return fail(2, "invalid vector json"); }
+  if (!Array.isArray(vector)) return fail(2, "vector must be a JSON array");
+  const safe = JSON.stringify(vector);
+
   if (searchType === "sources") {
-    return exec(`vec search source_embeddings '${esc(vectorArg)}' --k ${k}`);
+    return exec(`vec search source_embeddings '${esc(safe)}' --k ${k}`);
   }
   if (searchType === "all") {
-    return exec(`vec search-across "page_embeddings,source_embeddings" '${esc(vectorArg)}' --k ${k}`);
+    return exec(`vec search-across "page_embeddings,source_embeddings" '${esc(safe)}' --k ${k}`);
   }
-  return exec(`vec search page_embeddings '${esc(vectorArg)}' --k ${k}`);
+  return exec(`vec search page_embeddings '${esc(safe)}' --k ${k}`);
 }
 
 // ── EMBED ─────────────────────────────────────────────────
 
-async function wikiEmbed(exec: Exec, positional: string[]): Promise<ExecResult> {
-  // wiki embed <page|source> <id> <vector-json> [--meta=<json>]
+async function wikiEmbed(exec: Exec, positional: string[], flags: Map<string, string>): Promise<ExecResult> {
+  // wiki embed <page|source> <id> <vector-json> [--meta='<json>']
   const target = positional[1]; // "page" or "source"
   const id = positional[2];
   const vectorArg = positional[3];
 
   if (!target || !id || !vectorArg) {
     return fail(2, "usage: wiki embed <page|source> <id> '<vector-json>' [--meta='<json>']");
+  }
+  if (target !== "page" && target !== "source") {
+    return fail(2, `unknown embed target: ${target} (expected page|source)`);
   }
 
   let vector: number[];
@@ -488,14 +527,10 @@ async function wikiEmbed(exec: Exec, positional: string[]): Promise<ExecResult> 
     await exec(`vec remove ${coll} ${id}`);
   }
 
-  // Find --meta flag in remaining positional args
-  let metaFlag = "";
-  for (let i = 4; i < positional.length; i++) {
-    const a = positional[i];
-    if (a.startsWith("--meta=")) {
-      metaFlag = ` --meta '${esc(a.slice(7))}'`;
-    }
-  }
+  // Read --meta from flags so position-independent invocations work,
+  // matching every other handler in this file.
+  const meta = flags.get("meta");
+  const metaFlag = meta ? ` --meta '${esc(meta)}'` : "";
 
   return exec(`vec store ${coll} ${id} '${esc(JSON.stringify(vector))}'${metaFlag}`);
 }
@@ -507,7 +542,7 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
 
   const allPagesR = await exec(`db pages find '{}' --project slug,title,type,links_to,linked_from,source_ids,tags,content`);
   if (allPagesR.exitCode !== 0) return allPagesR;
-  const pages = JSON.parse(allPagesR.stdout) as Array<Record<string, unknown>>;
+  const pages = (safeParseAny(allPagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
   const slugSet = new Set(pages.map((p) => p.slug as string));
 
   for (const page of pages) {
@@ -545,8 +580,8 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
   // Missing embeddings
   const vecStatsR = await exec(`vec stats page_embeddings`);
   if (vecStatsR.exitCode === 0) {
-    const vc = JSON.parse(vecStatsR.stdout);
-    if (vc.count < pages.length) {
+    const vc = safeParseAny(vecStatsR.stdout) as { count?: number } | null;
+    if (vc && typeof vc.count === "number" && vc.count < pages.length) {
       issues.push({ type: "missing-embeddings", severity: "warning", message: `${pages.length - vc.count} pages missing vector embeddings` });
     }
   }
@@ -554,7 +589,7 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
   // Unreferenced sources
   const sourcesR = await exec(`db sources find '{}' --project _id,title`);
   if (sourcesR.exitCode === 0) {
-    const sources = JSON.parse(sourcesR.stdout) as Array<Record<string, unknown>>;
+    const sources = (safeParseAny(sourcesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
     const refIds = new Set(pages.flatMap((p) => (p.source_ids as string[]) ?? []));
     for (const src of sources) {
       if (!refIds.has(src._id as string)) {
@@ -604,26 +639,39 @@ async function logList(exec: Exec, flags: Map<string, string>): Promise<ExecResu
 async function wikiStats(exec: Exec): Promise<ExecResult> {
   const stats: Record<string, unknown> = {};
 
-  const pc = await exec(`db pages count '{}'`);
-  stats.pages = pc.exitCode === 0 ? JSON.parse(pc.stdout).count : 0;
+  const countOf = (r: ExecResult): number => {
+    if (r.exitCode !== 0) return 0;
+    const v = safeParseAny(r.stdout) as { count?: number } | null;
+    return v && typeof v.count === "number" ? v.count : 0;
+  };
 
-  const sc = await exec(`db sources count '{}'`);
-  stats.sources = sc.exitCode === 0 ? JSON.parse(sc.stdout).count : 0;
-
-  const lc = await exec(`db log count '{}'`);
-  stats.log_entries = lc.exitCode === 0 ? JSON.parse(lc.stdout).count : 0;
+  stats.pages = countOf(await exec(`db pages count '{}'`));
+  stats.sources = countOf(await exec(`db sources count '{}'`));
+  stats.log_entries = countOf(await exec(`db log count '{}'`));
 
   const bt = await exec(`db pages aggregate '[{"$group":{"_id":"$type","count":{"$sum":1}}}]'`);
-  if (bt.exitCode === 0) stats.pages_by_type = JSON.parse(bt.stdout);
+  if (bt.exitCode === 0) {
+    const v = safeParseAny(bt.stdout);
+    if (v !== null) stats.pages_by_type = v;
+  }
 
   const pv = await exec(`vec stats page_embeddings`);
-  if (pv.exitCode === 0) stats.page_embeddings = JSON.parse(pv.stdout);
+  if (pv.exitCode === 0) {
+    const v = safeParseAny(pv.stdout);
+    if (v !== null) stats.page_embeddings = v;
+  }
 
   const sv = await exec(`vec stats source_embeddings`);
-  if (sv.exitCode === 0) stats.source_embeddings = JSON.parse(sv.stdout);
+  if (sv.exitCode === 0) {
+    const v = safeParseAny(sv.stdout);
+    if (v !== null) stats.source_embeddings = v;
+  }
 
   const ra = await exec(`db log find '{}' --sort timestamp:-1 --limit 5 --project type,summary,timestamp`);
-  if (ra.exitCode === 0) stats.recent_activity = JSON.parse(ra.stdout);
+  if (ra.exitCode === 0) {
+    const v = safeParseAny(ra.stdout);
+    if (v !== null) stats.recent_activity = v;
+  }
 
   return ok(JSON.stringify(stats));
 }
@@ -637,7 +685,7 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
     // Re-derive all linked_from from links_to across all pages
     const allR = await exec(`db pages find '{}' --project slug,links_to`);
     if (allR.exitCode !== 0) return allR;
-    const pages = JSON.parse(allR.stdout) as Array<Record<string, unknown>>;
+    const pages = (safeParseAny(allR.stdout) as Array<Record<string, unknown>> | null) ?? [];
 
     // Build the reverse map
     const inbound: Record<string, string[]> = {};
@@ -664,7 +712,7 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
   // Default: list pages grouped by type
   const pagesR = await exec(`db pages find '{}' --project slug,title,type,tags,updated_at --sort type:1`);
   if (pagesR.exitCode !== 0) return pagesR;
-  const pages = JSON.parse(pagesR.stdout) as Array<Record<string, unknown>>;
+  const pages = (safeParseAny(pagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
 
   const byType: Record<string, Array<{ slug: string; title: string; tags: string[]; updated_at: string }>> = {};
   for (const p of pages) {
