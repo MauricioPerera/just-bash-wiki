@@ -210,9 +210,12 @@ wiki log trim --keep=1000
 
 All wiki operations are automatically logged with timestamps. For long-running
 agents, set `WikiOptions.logMaxEntries` to enable opportunistic auto-trim — the
-plugin samples the log size after each command and trims back to the cap when
-the count exceeds 1.5× the cap. `wiki log trim --keep=N` is always available
-for explicit trims regardless of the option.
+plugin samples the log size every 16 commands and trims back to the cap when
+the count exceeds 1.5× the cap. The log size therefore oscillates between
+`cap` (just after a trim) and approximately `1.5 × cap + 16` (just before the
+next sample fires); pick a `cap` of ≤ ⅔ of the largest acceptable log size.
+`wiki log trim --keep=N` is always available for explicit trims regardless of
+the option.
 
 ### Stats
 
@@ -314,6 +317,22 @@ When answering questions:
 | `log` | db | Operation log |
 | `page_embeddings` | vec | Page vector embeddings |
 | `source_embeddings` | vec | Source vector embeddings |
+
+## Validation
+
+`npm test` runs the unit suite (86 tests, in-memory). For an end-to-end run
+against real embeddings, `npm run e2e` exercises the full plugin surface
+against [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/)
+(`@cf/baai/bge-base-en-v1.5`, 768 dim by default).
+
+The script auto-detects credentials in this order:
+
+1. `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` env vars (preferred).
+2. `~/.wrangler/config/default.toml` OAuth token + `WRANGLER_ACCOUNT_ID`.
+
+If neither is available it exits 0 with a "skipped" notice, so the script is
+safe to wire into CI without making the build red on credential-less
+environments. Override the model with `E2E_MODEL=…` and `E2E_DIM=…`.
 
 ## License
 
