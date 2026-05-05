@@ -490,6 +490,118 @@ describe("wiki log", () => {
   });
 });
 
+// ── Log trim ──────────────────────────────────────────────
+
+describe("wiki log trim", () => {
+  beforeEach(async () => {
+    await run("wiki init --dim=4");
+  });
+
+  it("rejects missing --keep", async () => {
+    const r = await run("wiki log trim");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("usage");
+  });
+
+  it("rejects negative --keep", async () => {
+    const r = await run("wiki log trim --keep=-1");
+    expect(r.code).toBe(2);
+  });
+
+  it("is a no-op when count <= keep", async () => {
+    // After init there's one entry; keeping 5 should remove nothing.
+    const r = await run("wiki log trim --keep=5");
+    expect(r.code).toBe(0);
+    const data = json<{ removed: number }>(r.out);
+    expect(data.removed).toBe(0);
+  });
+
+  it("removes oldest entries beyond the keep window", async () => {
+    // Add 10 custom entries in deterministic order. Together with the init
+    // entry that's 11 total.
+    for (let i = 0; i < 10; i++) {
+      await run(`wiki log add '{"type":"custom","summary":"note ${i}"}'`);
+    }
+    const before = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(before.count).toBe(11);
+
+    const trim = await run("wiki log trim --keep=3");
+    expect(trim.code).toBe(0);
+    const data = json<{ kept: number; removed: number }>(trim.out);
+    expect(data.kept).toBe(3);
+    expect(data.removed).toBe(8);
+
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(after.count).toBe(3);
+
+    // The 3 most-recent entries should remain (notes 7, 8, 9).
+    const remaining = json<LogEntry[]>(
+      (await run(`db log find '{}' --sort timestamp:-1`)).out
+    );
+    const summaries = remaining.map((e) => e.summary);
+    expect(summaries).toContain("note 9");
+    expect(summaries).toContain("note 8");
+    expect(summaries).toContain("note 7");
+  });
+
+  it("--keep=0 removes everything", async () => {
+    for (let i = 0; i < 5; i++) {
+      await run(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const r = await run("wiki log trim --keep=0");
+    expect(r.code).toBe(0);
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    expect(after.count).toBe(0);
+  });
+});
+
+describe("WikiOptions.logMaxEntries auto-trim", () => {
+  it("does not run when not configured", async () => {
+    // Default plugin instance has no logMaxEntries.
+    await run("wiki init --dim=4");
+    for (let i = 0; i < 30; i++) {
+      await run(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const after = json<{ count: number }>((await run("db log count '{}'")).out);
+    // 1 (init) + 30 = 31, no trim.
+    expect(after.count).toBe(31);
+  });
+
+  it("trims opportunistically when cap is exceeded by ≥50%", async () => {
+    const capped = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/wiki", embeddingDim: 4, logMaxEntries: 4 }),
+    });
+    await capped.exec("wiki init --dim=4");
+
+    // Need both: enough writes for the 16-call sample to fire, and enough
+    // entries to exceed cap × 1.5 = 6 at the moment the sample fires.
+    for (let i = 0; i < 40; i++) {
+      await capped.exec(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+
+    const countR = await capped.exec("db log count '{}'");
+    const total = JSON.parse(countR.stdout).count as number;
+    // At least one trim must have brought the count back down to the cap.
+    // Some growth between trims is expected; assert it never settles unbounded.
+    expect(total).toBeLessThanOrEqual(4 + 16);  // cap + one full sample window
+  });
+
+  it("does not affect writes when below cap × 1.5", async () => {
+    const capped = new Bash({
+      fs: new InMemoryFs({}),
+      customCommands: createWikiPlugin({ rootDir: "/wiki", embeddingDim: 4, logMaxEntries: 50 }),
+    });
+    await capped.exec("wiki init --dim=4");
+    for (let i = 0; i < 20; i++) {
+      await capped.exec(`wiki log add '{"type":"x","summary":"${i}"}'`);
+    }
+    const total = JSON.parse((await capped.exec("db log count '{}'")).stdout).count as number;
+    // 1 init + 20 = 21, well below cap × 1.5 = 75.
+    expect(total).toBe(21);
+  });
+});
+
 // ── Stats ─────────────────────────────────────────────────
 
 describe("wiki stats", () => {
@@ -620,5 +732,208 @@ describe("edge cases", () => {
     await run("wiki init --dim=4");
     const r = await run("wiki embed page test 'not-json'");
     expect(r.code).toBe(2);
+  });
+});
+
+// ── Bug-fix regressions ───────────────────────────────────
+
+describe("pageUpdate not-found rejection (#2)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("returns exit 3 when slug doesn't exist", async () => {
+    const r = await run(`wiki page update ghost '{"$set":{"content":"x"}}'`);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("not found");
+  });
+
+  it("does not log a misleading entry on no-op update", async () => {
+    await run(`wiki page update ghost '{"$set":{"content":"x"}}'`);
+    const log = json<LogEntry[]>((await run("wiki log --last=20")).out);
+    expect(log.some((e) => e.summary?.includes?.("Page updated: ghost"))).toBe(false);
+  });
+
+  it("succeeds when slug exists", async () => {
+    await run(`wiki page create '{"slug":"real","title":"Real"}'`);
+    const r = await run(`wiki page update real '{"$set":{"content":"new"}}'`);
+    expect(r.code).toBe(0);
+  });
+});
+
+describe("sourceUpdate not-found rejection (#2)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("returns exit 3 when id doesn't exist", async () => {
+    const r = await run(`wiki source update fake-id '{"$set":{"status":"processed"}}'`);
+    expect(r.code).toBe(3);
+  });
+});
+
+describe("wikiSearch validation (#3, #6)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("rejects malformed vector json", async () => {
+    const r = await run(`wiki search 'not-an-array'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("invalid vector json");
+  });
+
+  it("rejects vectors that are not arrays", async () => {
+    const r = await run(`wiki search '{"x":1}'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("must be a JSON array");
+  });
+
+  it("rejects unknown --type values", async () => {
+    const r = await run(`wiki search '[1,2,3,4]' --type=bogus`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown --type");
+  });
+
+  it("accepts valid --type values", async () => {
+    for (const t of ["pages", "sources", "all"]) {
+      const r = await run(`wiki search '[1,0,0,0]' --k=1 --type=${t}`);
+      expect(r.code).toBe(0);
+    }
+  });
+});
+
+describe("wikiEmbed --meta position (#5)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("accepts --meta before the vector", async () => {
+    await run(`wiki page create '{"slug":"x","title":"X"}'`);
+    const r = await run(`wiki embed --meta='{"k":"v"}' page x '[1,0,0,0]'`);
+    expect(r.code).toBe(0);
+    const got = json<{ metadata?: Record<string, string> }>((await run("vec get page_embeddings x")).out);
+    expect(got.metadata?.k).toBe("v");
+  });
+
+  it("accepts --meta after the vector (legacy position)", async () => {
+    await run(`wiki page create '{"slug":"y","title":"Y"}'`);
+    const r = await run(`wiki embed page y '[1,0,0,0]' --meta='{"k":"v2"}'`);
+    expect(r.code).toBe(0);
+    const got = json<{ metadata?: Record<string, string> }>((await run("vec get page_embeddings y")).out);
+    expect(got.metadata?.k).toBe("v2");
+  });
+
+  it("rejects unknown embed target", async () => {
+    const r = await run(`wiki embed bogus xx '[1,0,0,0]'`);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown embed target");
+  });
+});
+
+describe("wiki index --rebuild repair (#10)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("rebuilds linked_from to match the inverse of links_to", async () => {
+    await run(`wiki page create '{"slug":"a","title":"A","links_to":["b"]}'`);
+    await run(`wiki page create '{"slug":"b","title":"B"}'`);
+    await run(`wiki page create '{"slug":"c","title":"C","links_to":["b"]}'`);
+
+    // Corrupt linked_from on b (extra ghost), and on a (false inbound).
+    await run(`db pages update '{"slug":"b"}' '{"$set":{"linked_from":["ghost","a"]}}'`);
+    await run(`db pages update '{"slug":"a"}' '{"$set":{"linked_from":["b"]}}'`);
+
+    const r = await run("wiki index --rebuild");
+    expect(r.code).toBe(0);
+
+    const a = json<Page[]>((await run("wiki page get a")).out)[0];
+    const b = json<Page[]>((await run("wiki page get b")).out)[0];
+    const c = json<Page[]>((await run("wiki page get c")).out)[0];
+
+    expect(a.linked_from).toEqual([]);
+    expect((b.linked_from ?? []).slice().sort()).toEqual(["a", "c"]);
+    expect(c.linked_from).toEqual([]);
+  });
+});
+
+// ── Pagination on list commands (#7) ─────────────────────
+
+describe("list pagination", () => {
+  beforeEach(async () => {
+    await run("wiki init --dim=4");
+    for (let i = 0; i < 12; i++) {
+      await run(`wiki source add '{"title":"src ${i}","type":"article"}'`);
+      await run(`wiki page create '{"slug":"p${i}","title":"P${i}","type":"concept"}'`);
+    }
+  });
+
+  it("source list respects --limit", async () => {
+    const r = await run("wiki source list --limit=5");
+    expect(json<Source[]>(r.out)).toHaveLength(5);
+  });
+
+  it("source list respects --offset", async () => {
+    const all = json<Source[]>((await run("wiki source list")).out);
+    const page2 = json<Source[]>((await run("wiki source list --limit=5 --offset=5")).out);
+    expect(page2).toHaveLength(5);
+    expect(page2[0].title).toBe(all[5].title);
+  });
+
+  it("page list respects --limit and --offset", async () => {
+    const all = json<Page[]>((await run("wiki page list")).out);
+    expect(all.length).toBeGreaterThanOrEqual(12);
+    const slice = json<Page[]>((await run("wiki page list --limit=4 --offset=2")).out);
+    expect(slice).toHaveLength(4);
+    expect(slice[0].slug).toBe(all[2].slug);
+  });
+
+  it("wiki index respects --limit", async () => {
+    const full = json<{ total: number }>((await run("wiki index")).out);
+    expect(full.total).toBeGreaterThanOrEqual(12);
+    const limited = json<{ total: number }>((await run("wiki index --limit=3")).out);
+    expect(limited.total).toBe(3);
+  });
+
+  it("non-integer pagination flags are silently ignored", async () => {
+    // Garbage input should not break the call; we just lose the flag.
+    const r = await run("wiki page list --limit=abc --offset=-1");
+    expect(r.code).toBe(0);
+  });
+});
+
+describe("page orphans uses db query (#7)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("returns only pages with empty linked_from", async () => {
+    await run(`wiki page create '{"slug":"hub","title":"Hub","links_to":["leaf"]}'`);
+    await run(`wiki page create '{"slug":"leaf","title":"Leaf"}'`);
+    await run(`wiki page create '{"slug":"island","title":"Island"}'`);
+
+    const orphans = json<Page[]>((await run("wiki page orphans")).out);
+    const slugs = orphans.map((p) => p.slug).sort();
+    // hub has no inbound, leaf is referenced by hub, island has none.
+    expect(slugs).toEqual(["hub", "island"]);
+  });
+
+  it("respects --limit", async () => {
+    for (let i = 0; i < 8; i++) {
+      await run(`wiki page create '{"slug":"o${i}","title":"O${i}"}'`);
+    }
+    const slice = json<Page[]>((await run("wiki page orphans --limit=3")).out);
+    expect(slice).toHaveLength(3);
+  });
+});
+
+describe("wiki lint perf (#8)", () => {
+  beforeEach(async () => { await run("wiki init --dim=4"); });
+
+  it("flags pages with empty content as before", async () => {
+    await run(`wiki page create '{"slug":"empty","title":"Empty","content":""}'`);
+    await run(`wiki page create '{"slug":"full","title":"Full","content":"# Full\\nbody"}'`);
+    const r = json<LintResult>((await run("wiki lint")).out);
+    const empties = r.issues.filter((i) => i.type === "empty-content").map((i) => i.slug);
+    expect(empties).toContain("empty");
+    expect(empties).not.toContain("full");
+  });
+
+  it("flags pages with no content field as empty", async () => {
+    // pageCreate now defaults content to "", so the field is always present
+    // but matches the empty check.
+    await run(`wiki page create '{"slug":"missing","title":"Missing"}'`);
+    const r = json<LintResult>((await run("wiki lint")).out);
+    const empties = r.issues.filter((i) => i.type === "empty-content").map((i) => i.slug);
+    expect(empties).toContain("missing");
   });
 });

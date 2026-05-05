@@ -11,6 +11,11 @@ export interface WikiOptions extends PluginOptions {
   metric?: "cosine" | "euclidean" | "dot";
   /** Default vector quantization (default: float32). Overridden by --quantize flag on init. */
   quantize?: "float32" | "int8";
+  /** Cap on entries kept in `db log`. When exceeded by ≥50% (hysteresis), an
+   *  opportunistic trim runs after the next write, keeping the N most recent.
+   *  Disabled when omitted or 0. Manual trim is always available via
+   *  `wiki log trim --keep=N`. */
+  logMaxEntries?: number;
 }
 
 export interface Page {
@@ -23,6 +28,10 @@ export interface Page {
   links_to: string[];
   linked_from: string[];
   source_ids: string[];
+  /** Free-form page lifecycle marker (e.g. "draft", "published"). Optional; not
+   *  set automatically by `pageCreate` — callers manage it. Filterable via
+   *  `wiki page list --status=<value>`. */
+  status?: string;
   created_at: string;
   updated_at: string;
 }
@@ -94,14 +103,45 @@ const safeParse = (s: string | undefined): unknown[] | null => {
   try { const v = JSON.parse(s); return Array.isArray(v) ? v : null; } catch { return null; }
 };
 
+/** Parse any JSON value tolerantly. Returns null on empty/invalid input
+ *  so callers can guard a single nullish check instead of try/catching. */
+const safeParseAny = (s: string | undefined): unknown => {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch { return null; }
+};
+
+/** Build the trailing portion of a `db ... find` command for paginated calls.
+ *  Reads `--limit` / `--offset` from the wiki-level flag map and emits the
+ *  corresponding `--limit N --skip M` for `db`. Returns "" when neither is set
+ *  so existing call sites keep their unlimited behaviour by default.
+ *  Negative or non-integer values are dropped silently — db will reject them
+ *  if they slip through, but we'd rather not 500 a list call over a typo. */
+const paginationFlags = (flags: Map<string, string>): string => {
+  const parts: string[] = [];
+  const limit = flags.get("limit");
+  const offset = flags.get("offset") ?? flags.get("skip");
+  if (limit !== undefined) {
+    const n = Number(limit);
+    if (Number.isInteger(n) && n >= 0) parts.push(`--limit ${n}`);
+  }
+  if (offset !== undefined) {
+    const n = Number(offset);
+    if (Number.isInteger(n) && n >= 0) parts.push(`--skip ${n}`);
+  }
+  return parts.length ? " " + parts.join(" ") : "";
+};
+
 // ── Wiki Command ───────────────────────────────────────────
 // NOTE: this plugin assumes single-writer semantics. Concurrent
 // page creations with cross-links may produce inconsistent
 // linked_from arrays. Use `wiki index --rebuild` to re-derive them.
 
-interface InitDefaults { dim: number; metric: string; quantize: string }
+interface InitDefaults { dim: number; metric: string; quantize: string; logMaxEntries: number }
 
 function buildWikiCommand(defaults: InitDefaults): Command {
+  // Per-plugin-instance write counter for opportunistic log trim. Lives in
+  // the closure so multiple createWikiPlugin() instances don't share state.
+  let logWritesSinceTrim = 0;
   return defineCommand("wiki", async (args, ctx) => {
     const exec: Exec = (cmd: string) => {
       if (!ctx.exec) return Promise.resolve({ stdout: "", stderr: "ctx.exec unavailable", exitCode: 1 } as ExecResult);
@@ -123,50 +163,76 @@ function buildWikiCommand(defaults: InitDefaults): Command {
     const sub = positional[0];
     if (!sub) return fail(2, "usage: wiki <init|source|page|search|embed|lint|log|stats|index> [...]");
 
-    switch (sub) {
-      case "init": return wikiInit(exec, flags, defaults);
+    const dispatch = async (): Promise<ExecResult> => {
+      switch (sub) {
+        case "init": return wikiInit(exec, flags, defaults);
 
-      case "source": {
-        const op = positional[1];
-        switch (op) {
-          case "add": return sourceAdd(exec, positional.slice(2).join(" "));
-          case "list": return sourceList(exec, flags);
-          case "get": return sourceGet(exec, positional[2]);
-          case "count": return sourceCount(exec);
-          case "update": return sourceUpdate(exec, positional[2], positional.slice(3).join(" "));
-          case "delete": return sourceDelete(exec, positional[2]);
-          default: return fail(2, "usage: wiki source <add|list|get|count|update|delete> [...]");
+        case "source": {
+          const op = positional[1];
+          switch (op) {
+            case "add": return sourceAdd(exec, positional.slice(2).join(" "));
+            case "list": return sourceList(exec, flags);
+            case "get": return sourceGet(exec, positional[2]);
+            case "count": return sourceCount(exec);
+            case "update": return sourceUpdate(exec, positional[2], positional.slice(3).join(" "));
+            case "delete": return sourceDelete(exec, positional[2]);
+            default: return fail(2, "usage: wiki source <add|list|get|count|update|delete> [...]");
+          }
+        }
+
+        case "page": {
+          const op = positional[1];
+          switch (op) {
+            case "create": return pageCreate(exec, positional.slice(2).join(" "));
+            case "update": return pageUpdate(exec, positional[2], positional.slice(3).join(" "));
+            case "get": return pageGet(exec, positional[2]);
+            case "list": return pageList(exec, flags);
+            case "delete": return pageDelete(exec, positional[2]);
+            case "rename": return pageRename(exec, positional[2], positional[3]);
+            case "orphans": return pageOrphans(exec, flags);
+            default: return fail(2, "usage: wiki page <create|update|get|list|delete|rename|orphans> [...]");
+          }
+        }
+
+        case "search": return wikiSearch(exec, positional.slice(1).join(" "), flags);
+        case "embed": return wikiEmbed(exec, positional, flags);
+        case "lint": return wikiLint(exec);
+
+        case "log": {
+          if (positional[1] === "add") return logAdd(exec, positional.slice(2).join(" "));
+          if (positional[1] === "trim") return logTrim(exec, flags);
+          return logList(exec, flags);
+        }
+
+        case "stats": return wikiStats(exec);
+        case "index": return wikiIndex(exec, flags);
+
+        default: return fail(2, `unknown wiki command: ${sub}`);
+      }
+    };
+
+    const result = await dispatch();
+
+    // Opportunistic log auto-trim. Most subcommands write a log entry via
+    // appendLog; rather than instrument every callsite, we sample after the
+    // dispatch returns. The 16-call period bounds the per-call cost (≈one
+    // count() per 16 invocations) while still trimming promptly under load.
+    // The 1.5× hysteresis prevents trimming on every Kth call when sitting
+    // right at the cap.
+    const cap = defaults.logMaxEntries;
+    if (cap > 0) {
+      logWritesSinceTrim++;
+      if (logWritesSinceTrim >= 16) {
+        logWritesSinceTrim = 0;
+        const countR = await exec(`db log count '{}'`);
+        if (countR.exitCode === 0) {
+          const total = (safeParseAny(countR.stdout) as { count?: number } | null)?.count ?? 0;
+          if (total > Math.floor(cap * 1.5)) await trimLogToKeepN(exec, cap);
         }
       }
-
-      case "page": {
-        const op = positional[1];
-        switch (op) {
-          case "create": return pageCreate(exec, positional.slice(2).join(" "));
-          case "update": return pageUpdate(exec, positional[2], positional.slice(3).join(" "));
-          case "get": return pageGet(exec, positional[2]);
-          case "list": return pageList(exec, flags);
-          case "delete": return pageDelete(exec, positional[2]);
-          case "rename": return pageRename(exec, positional[2], positional[3]);
-          case "orphans": return pageOrphans(exec);
-          default: return fail(2, "usage: wiki page <create|update|get|list|delete|rename|orphans> [...]");
-        }
-      }
-
-      case "search": return wikiSearch(exec, positional.slice(1).join(" "), flags);
-      case "embed": return wikiEmbed(exec, positional);
-      case "lint": return wikiLint(exec);
-
-      case "log": {
-        if (positional[1] === "add") return logAdd(exec, positional.slice(2).join(" "));
-        return logList(exec, flags);
-      }
-
-      case "stats": return wikiStats(exec);
-      case "index": return wikiIndex(exec, flags);
-
-      default: return fail(2, `unknown wiki command: ${sub}`);
     }
+
+    return result;
   });
 }
 
@@ -198,15 +264,17 @@ async function wikiInit(exec: Exec, flags: Map<string, string>, defaults: InitDe
   await seedIfEmpty("pages", [`db pages index create slug --unique`, `db pages index create type`]);
   await seedIfEmpty("log", []);
 
-  const vecCreate = async (coll: string) => {
+  const vecCreate = async (coll: string): Promise<ExecResult | null> => {
     const r = await exec(`vec create ${coll} --dim ${dim} --metric ${metric} --quantize ${quantize}`);
-    if (r.exitCode === 0) results.push(`vec ${coll}: created`);
-    else if (r.stderr.includes("collection exists")) results.push(`vec ${coll}: exists`);
-    else return fail(r.exitCode, r.stderr.trim());
+    if (r.exitCode === 0) { results.push(`vec ${coll}: created`); return null; }
+    if (r.stderr.includes("collection exists")) { results.push(`vec ${coll}: exists`); return null; }
+    return fail(r.exitCode, r.stderr.trim());
   };
 
-  await vecCreate("page_embeddings");
-  await vecCreate("source_embeddings");
+  const e1 = await vecCreate("page_embeddings");
+  if (e1) return e1;
+  const e2 = await vecCreate("source_embeddings");
+  if (e2) return e2;
   await appendLog(exec, "init", "Wiki initialized");
 
   return ok(JSON.stringify({ initialized: true, collections: results }));
@@ -237,7 +305,8 @@ async function sourceList(exec: Exec, flags: Map<string, string>): Promise<ExecR
   const status = flags.get("status");
   if (type) filter.type = type;
   if (status) filter.status = status;
-  return exec(`${dbCmd("sources", "find", filter)} --project title,type,status,ingested_at`);
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("sources", "find", filter)} --project title,type,status,ingested_at${pag}`);
 }
 
 async function sourceGet(exec: Exec, id?: string): Promise<ExecResult> {
@@ -256,6 +325,9 @@ async function sourceUpdate(exec: Exec, id?: string, jsonArg?: string): Promise<
 
   const r = await exec(`${dbCmd("sources", "update", { _id: id }, update)}`);
   if (r.exitCode !== 0) return r;
+  let matched = 0;
+  try { matched = (JSON.parse(r.stdout) as { matched?: number }).matched ?? 0; } catch { /* tolerate */ }
+  if (matched === 0) return fail(3, `not found: ${id}`);
   await appendLog(exec, "source-update", `Source updated: ${id}`, { source_id: id });
   return r;
 }
@@ -289,6 +361,10 @@ async function pageCreate(exec: Exec, jsonArg: string): Promise<ExecResult> {
   doc.source_ids = doc.source_ids ?? [];
   doc.tags = doc.tags ?? [];
   doc.type = doc.type ?? "concept";
+  // Normalise content to "" when omitted so the field is always present.
+  // Page.content is typed as `string`, and lint's empty-content check can
+  // rely on a single equality query instead of needing $exists fallbacks.
+  doc.content = doc.content ?? "";
   doc.created_at = now();
   doc.updated_at = doc.created_at;
 
@@ -331,6 +407,11 @@ async function pageUpdate(exec: Exec, slug?: string, jsonArg?: string): Promise<
 
   const r = await exec(`${dbCmd("pages", "update", { slug }, update)}`);
   if (r.exitCode !== 0) return r;
+  // Reject silent no-ops: db returns {matched, modified}; if nothing matched
+  // the slug doesn't exist and we shouldn't write a misleading log entry.
+  let matched = 0;
+  try { matched = (JSON.parse(r.stdout) as { matched?: number }).matched ?? 0; } catch { /* tolerate */ }
+  if (matched === 0) return fail(3, `not found: ${slug}`);
   await appendLog(exec, "page-update", `Page updated: ${slug}`, { slug });
   return r;
 }
@@ -348,7 +429,8 @@ async function pageList(exec: Exec, flags: Map<string, string>): Promise<ExecRes
   if (type) filter.type = type;
   if (tag) filter.tags = { $contains: tag };
   if (status) filter.status = status;
-  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,tags,updated_at`);
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,tags,updated_at${pag}`);
 }
 
 async function pageDelete(exec: Exec, slug?: string): Promise<ExecResult> {
@@ -437,15 +519,13 @@ async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promi
   return ok(JSON.stringify({ old_slug: oldSlug, new_slug: newSlug }));
 }
 
-async function pageOrphans(exec: Exec): Promise<ExecResult> {
-  const r = await exec(`db pages find '{}' --project slug,title,type,linked_from,links_to`);
-  if (r.exitCode !== 0) return r;
-  const pages = JSON.parse(r.stdout) as Array<Record<string, unknown>>;
-  const orphans = pages.filter((p) => {
-    const lf = p.linked_from as string[] | undefined;
-    return !lf || lf.length === 0;
-  });
-  return ok(JSON.stringify(orphans));
+async function pageOrphans(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
+  // Push the orphan filter into the db query instead of loading every page
+  // and filtering in JS. pageCreate always initialises linked_from = [], but
+  // the $or covers legacy/imported data where the field may be missing/null.
+  const filter = { $or: [{ linked_from: null }, { linked_from: { $size: 0 } }] };
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,linked_from,links_to${pag}`);
 }
 
 // ── SEARCH ────────────────────────────────────────────────
@@ -455,25 +535,43 @@ async function wikiSearch(exec: Exec, vectorArg: string, flags: Map<string, stri
   const k = flags.get("k") ?? "10";
   const searchType = flags.get("type");
 
+  // Whitelist accepted --type values; unknown values must fail loudly,
+  // not silently fall through to pages.
+  const VALID_TYPES = new Set([undefined, "pages", "sources", "all"]);
+  if (!VALID_TYPES.has(searchType)) {
+    return fail(2, `unknown --type: ${searchType} (expected pages|sources|all)`);
+  }
+
+  // Parse and revalidate the vector at the wiki layer so users get a clear
+  // usage error instead of a vec-internal one for malformed input. JSON.stringify
+  // also strips any garbage that survived the bash quoting.
+  let vector: unknown;
+  try { vector = JSON.parse(vectorArg); } catch { return fail(2, "invalid vector json"); }
+  if (!Array.isArray(vector)) return fail(2, "vector must be a JSON array");
+  const safe = JSON.stringify(vector);
+
   if (searchType === "sources") {
-    return exec(`vec search source_embeddings '${esc(vectorArg)}' --k ${k}`);
+    return exec(`vec search source_embeddings '${esc(safe)}' --k ${k}`);
   }
   if (searchType === "all") {
-    return exec(`vec search-across "page_embeddings,source_embeddings" '${esc(vectorArg)}' --k ${k}`);
+    return exec(`vec search-across "page_embeddings,source_embeddings" '${esc(safe)}' --k ${k}`);
   }
-  return exec(`vec search page_embeddings '${esc(vectorArg)}' --k ${k}`);
+  return exec(`vec search page_embeddings '${esc(safe)}' --k ${k}`);
 }
 
 // ── EMBED ─────────────────────────────────────────────────
 
-async function wikiEmbed(exec: Exec, positional: string[]): Promise<ExecResult> {
-  // wiki embed <page|source> <id> <vector-json> [--meta=<json>]
+async function wikiEmbed(exec: Exec, positional: string[], flags: Map<string, string>): Promise<ExecResult> {
+  // wiki embed <page|source> <id> <vector-json> [--meta='<json>']
   const target = positional[1]; // "page" or "source"
   const id = positional[2];
   const vectorArg = positional[3];
 
   if (!target || !id || !vectorArg) {
     return fail(2, "usage: wiki embed <page|source> <id> '<vector-json>' [--meta='<json>']");
+  }
+  if (target !== "page" && target !== "source") {
+    return fail(2, `unknown embed target: ${target} (expected page|source)`);
   }
 
   let vector: number[];
@@ -488,14 +586,10 @@ async function wikiEmbed(exec: Exec, positional: string[]): Promise<ExecResult> 
     await exec(`vec remove ${coll} ${id}`);
   }
 
-  // Find --meta flag in remaining positional args
-  let metaFlag = "";
-  for (let i = 4; i < positional.length; i++) {
-    const a = positional[i];
-    if (a.startsWith("--meta=")) {
-      metaFlag = ` --meta '${esc(a.slice(7))}'`;
-    }
-  }
+  // Read --meta from flags so position-independent invocations work,
+  // matching every other handler in this file.
+  const meta = flags.get("meta");
+  const metaFlag = meta ? ` --meta '${esc(meta)}'` : "";
 
   return exec(`vec store ${coll} ${id} '${esc(JSON.stringify(vector))}'${metaFlag}`);
 }
@@ -505,9 +599,12 @@ async function wikiEmbed(exec: Exec, positional: string[]): Promise<ExecResult> 
 async function wikiLint(exec: Exec): Promise<ExecResult> {
   const issues: LintIssue[] = [];
 
-  const allPagesR = await exec(`db pages find '{}' --project slug,title,type,links_to,linked_from,source_ids,tags,content`);
+  // Main pass: project everything *except* content. The content field
+  // can be MBs per page; lint never reads it, only checks emptiness.
+  // The empty-content check is delegated to a targeted query below.
+  const allPagesR = await exec(`db pages find '{}' --project slug,title,type,links_to,linked_from,source_ids,tags`);
   if (allPagesR.exitCode !== 0) return allPagesR;
-  const pages = JSON.parse(allPagesR.stdout) as Array<Record<string, unknown>>;
+  const pages = (safeParseAny(allPagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
   const slugSet = new Set(pages.map((p) => p.slug as string));
 
   for (const page of pages) {
@@ -527,10 +624,6 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
       }
     }
 
-    if (!page.content || (page.content as string).trim().length === 0) {
-      issues.push({ type: "empty-content", severity: "warning", message: "Page has no content", slug });
-    }
-
     const tags = page.tags as string[] | undefined;
     if (!tags || tags.length === 0) {
       issues.push({ type: "no-tags", severity: "info", message: "Page has no tags", slug });
@@ -542,11 +635,34 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
     }
   }
 
+  // Targeted empty-content pass: a separate query that only returns the slugs
+  // whose content is null/missing/empty. Whitespace-only content slips
+  // through this filter — accepted tradeoff vs. shipping every page body
+  // through stdout. Detection of pure-whitespace can be added later via
+  // a server-side derived field if it ever matters.
+  const emptyR = await exec(
+    `${dbCmd("pages", "find", {
+      $or: [
+        { content: { $exists: false } },
+        { content: null },
+        { content: "" },
+      ],
+    })} --project slug`
+  );
+  if (emptyR.exitCode === 0) {
+    const empty = (safeParseAny(emptyR.stdout) as Array<{ slug?: string }> | null) ?? [];
+    for (const p of empty) {
+      if (typeof p.slug === "string") {
+        issues.push({ type: "empty-content", severity: "warning", message: "Page has no content", slug: p.slug });
+      }
+    }
+  }
+
   // Missing embeddings
   const vecStatsR = await exec(`vec stats page_embeddings`);
   if (vecStatsR.exitCode === 0) {
-    const vc = JSON.parse(vecStatsR.stdout);
-    if (vc.count < pages.length) {
+    const vc = safeParseAny(vecStatsR.stdout) as { count?: number } | null;
+    if (vc && typeof vc.count === "number" && vc.count < pages.length) {
       issues.push({ type: "missing-embeddings", severity: "warning", message: `${pages.length - vc.count} pages missing vector embeddings` });
     }
   }
@@ -554,7 +670,7 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
   // Unreferenced sources
   const sourcesR = await exec(`db sources find '{}' --project _id,title`);
   if (sourcesR.exitCode === 0) {
-    const sources = JSON.parse(sourcesR.stdout) as Array<Record<string, unknown>>;
+    const sources = (safeParseAny(sourcesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
     const refIds = new Set(pages.flatMap((p) => (p.source_ids as string[]) ?? []));
     for (const src of sources) {
       if (!refIds.has(src._id as string)) {
@@ -591,6 +707,39 @@ async function logAdd(exec: Exec, jsonArg: string): Promise<ExecResult> {
   return exec(dbCmd("log", "insert", entry));
 }
 
+async function logTrim(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
+  const keepStr = flags.get("keep");
+  if (!keepStr) return fail(2, "usage: wiki log trim --keep=<N>");
+  const keep = Number(keepStr);
+  if (!Number.isInteger(keep) || keep < 0) return fail(2, "--keep must be a non-negative integer");
+
+  const removed = await trimLogToKeepN(exec, keep);
+  return ok(JSON.stringify({ kept: keep, removed }));
+}
+
+/** Delete all log entries beyond the `keep` most recent. Uses _id-based
+ *  removal (not timestamp ranges) so concurrent writes with identical
+ *  timestamps are handled correctly. Returns the number of entries removed. */
+async function trimLogToKeepN(exec: Exec, keep: number): Promise<number> {
+  // Count first so we can short-circuit when there's nothing to trim.
+  const countR = await exec(`db log count '{}'`);
+  if (countR.exitCode !== 0) return 0;
+  const total = (safeParseAny(countR.stdout) as { count?: number } | null)?.count ?? 0;
+  if (total <= keep) return 0;
+
+  // Find the _ids of everything past the keep window. Sorted oldest-first
+  // (timestamp:1) so --limit picks the right slice without --skip math.
+  const toRemove = total - keep;
+  const oldR = await exec(`db log find '{}' --sort timestamp:1 --limit ${toRemove} --project _id`);
+  if (oldR.exitCode !== 0) return 0;
+  const docs = (safeParseAny(oldR.stdout) as Array<{ _id?: string }> | null) ?? [];
+  const ids = docs.map((d) => d._id).filter((x): x is string => typeof x === "string");
+  if (ids.length === 0) return 0;
+
+  await exec(`${dbCmd("log", "remove", { _id: { $in: ids } })} --many`);
+  return ids.length;
+}
+
 async function logList(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
   const last = flags.get("last") ?? "20";
   const type = flags.get("type");
@@ -604,26 +753,39 @@ async function logList(exec: Exec, flags: Map<string, string>): Promise<ExecResu
 async function wikiStats(exec: Exec): Promise<ExecResult> {
   const stats: Record<string, unknown> = {};
 
-  const pc = await exec(`db pages count '{}'`);
-  stats.pages = pc.exitCode === 0 ? JSON.parse(pc.stdout).count : 0;
+  const countOf = (r: ExecResult): number => {
+    if (r.exitCode !== 0) return 0;
+    const v = safeParseAny(r.stdout) as { count?: number } | null;
+    return v && typeof v.count === "number" ? v.count : 0;
+  };
 
-  const sc = await exec(`db sources count '{}'`);
-  stats.sources = sc.exitCode === 0 ? JSON.parse(sc.stdout).count : 0;
-
-  const lc = await exec(`db log count '{}'`);
-  stats.log_entries = lc.exitCode === 0 ? JSON.parse(lc.stdout).count : 0;
+  stats.pages = countOf(await exec(`db pages count '{}'`));
+  stats.sources = countOf(await exec(`db sources count '{}'`));
+  stats.log_entries = countOf(await exec(`db log count '{}'`));
 
   const bt = await exec(`db pages aggregate '[{"$group":{"_id":"$type","count":{"$sum":1}}}]'`);
-  if (bt.exitCode === 0) stats.pages_by_type = JSON.parse(bt.stdout);
+  if (bt.exitCode === 0) {
+    const v = safeParseAny(bt.stdout);
+    if (v !== null) stats.pages_by_type = v;
+  }
 
   const pv = await exec(`vec stats page_embeddings`);
-  if (pv.exitCode === 0) stats.page_embeddings = JSON.parse(pv.stdout);
+  if (pv.exitCode === 0) {
+    const v = safeParseAny(pv.stdout);
+    if (v !== null) stats.page_embeddings = v;
+  }
 
   const sv = await exec(`vec stats source_embeddings`);
-  if (sv.exitCode === 0) stats.source_embeddings = JSON.parse(sv.stdout);
+  if (sv.exitCode === 0) {
+    const v = safeParseAny(sv.stdout);
+    if (v !== null) stats.source_embeddings = v;
+  }
 
   const ra = await exec(`db log find '{}' --sort timestamp:-1 --limit 5 --project type,summary,timestamp`);
-  if (ra.exitCode === 0) stats.recent_activity = JSON.parse(ra.stdout);
+  if (ra.exitCode === 0) {
+    const v = safeParseAny(ra.stdout);
+    if (v !== null) stats.recent_activity = v;
+  }
 
   return ok(JSON.stringify(stats));
 }
@@ -637,7 +799,7 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
     // Re-derive all linked_from from links_to across all pages
     const allR = await exec(`db pages find '{}' --project slug,links_to`);
     if (allR.exitCode !== 0) return allR;
-    const pages = JSON.parse(allR.stdout) as Array<Record<string, unknown>>;
+    const pages = (safeParseAny(allR.stdout) as Array<Record<string, unknown>> | null) ?? [];
 
     // Build the reverse map
     const inbound: Record<string, string[]> = {};
@@ -661,10 +823,12 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
     return ok(JSON.stringify({ rebuilt: true, pages: pages.length }));
   }
 
-  // Default: list pages grouped by type
-  const pagesR = await exec(`db pages find '{}' --project slug,title,type,tags,updated_at --sort type:1`);
+  // Default: list pages grouped by type. Pagination only affects this view —
+  // --rebuild always processes every page (correctness > scalability there).
+  const pag = paginationFlags(flags);
+  const pagesR = await exec(`db pages find '{}' --project slug,title,type,tags,updated_at --sort type:1${pag}`);
   if (pagesR.exitCode !== 0) return pagesR;
-  const pages = JSON.parse(pagesR.stdout) as Array<Record<string, unknown>>;
+  const pages = (safeParseAny(pagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
 
   const byType: Record<string, Array<{ slug: string; title: string; tags: string[]; updated_at: string }>> = {};
   for (const p of pages) {
@@ -687,6 +851,7 @@ export function createWikiPlugin(opts: WikiOptions = {}): Command[] {
     dim: opts.embeddingDim ?? 1536,
     metric: opts.metric ?? "cosine",
     quantize: opts.quantize ?? "float32",
+    logMaxEntries: opts.logMaxEntries ?? 0,
   };
 
   const dataPlugin = createDataPlugin({
