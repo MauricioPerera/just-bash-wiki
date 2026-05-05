@@ -24,7 +24,7 @@
 - `pageCreate` now initialises `content` to `""` when omitted, so the field is always present (matching `Page.content: string`).
 
 ### Tests
-- 32 new tests covering all the above (slug not-found, search/embed validation, pagination, orphans-by-query, lint perf, `wiki index --rebuild` correctness with corrupted `linked_from` (#10), log trim manual + opportunistic auto-trim)
+- 29 new tests covering all the above (slug not-found, search/embed validation, pagination, orphans-by-query, lint perf, `wiki index --rebuild` correctness with corrupted `linked_from` (#10), log trim manual + opportunistic auto-trim) — total 86 (up from 57 in v1.1.3).
 
 ## [1.1.3] - 2026-05-02
 
