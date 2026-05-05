@@ -144,7 +144,7 @@ wiki page rename <old-slug> <new-slug>
 wiki page orphans [--limit=50] [--offset=0]
 ```
 
-**Page fields:** `_id` (auto-generated), `slug` (required, unique), `title` (required), `type`, `content`, `tags`, `links_to`, `source_ids`. Auto-managed: `linked_from`, `created_at`, `updated_at`.
+**Page fields:** `_id` (auto-generated), `slug` (required, unique), `title` (required), `type` (defaults to `"concept"`), `content` (defaults to `""`), `tags` (defaults to `[]`), `links_to` (defaults to `[]`), `source_ids` (defaults to `[]`), `status` (optional free-form lifecycle marker, e.g. `"draft"` / `"published"`; not set automatically — callers manage it; filterable via `--status`). Auto-managed: `linked_from`, `created_at`, `updated_at`.
 
 **Slug format:** must match `^[a-z0-9][a-z0-9_-]*$` — lowercase alphanumeric, hyphens, and underscores. Must start with a letter or digit.
 
@@ -153,14 +153,14 @@ wiki page orphans [--limit=50] [--offset=0]
 ### Embeddings
 
 ```bash
-# Store/update a page embedding
-wiki embed page <slug> '[0.1, 0.2, ...]'
+# Store/update a page embedding (with optional metadata)
+wiki embed page <slug> '[0.1, 0.2, ...]' [--meta='{"key":"value"}']
 
 # Store/update a source embedding
-wiki embed source <id> '[0.1, 0.2, ...]'
+wiki embed source <id> '[0.1, 0.2, ...]' [--meta='{"key":"value"}']
 ```
 
-Embeddings are stored in vector collections (`page_embeddings`, `source_embeddings`) for semantic search. The embedding dimension must match what was set in `wiki init --dim=N`.
+Embeddings are stored in vector collections (`page_embeddings`, `source_embeddings`) for semantic search. The embedding dimension must match what was set in `wiki init --dim=N`. The optional `--meta` JSON is attached to the vector record and returned by `vec get`/`wiki search`; useful for round-tripping titles, model identifiers, or chunk indices alongside the vector. Position-independent — `--meta=...` may appear before or after the vector argument.
 
 ### Search
 
@@ -175,7 +175,7 @@ wiki search '[0.1, 0.2, ...]' --k=5 --type=sources
 wiki search '[0.1, 0.2, ...]' --k=10 --type=all
 ```
 
-Returns results sorted by cosine similarity with scores and metadata.
+Returns results sorted by similarity using the metric configured in `wiki init --metric=<cosine|euclidean|dot>` (default: `cosine`). Each hit includes the score and any metadata stored alongside the vector via `wiki embed --meta=...`.
 
 ### Lint
 
@@ -189,11 +189,13 @@ Runs a health check and reports issues:
 |-------|----------|-------------|
 | `orphan` | warning | Page has no inbound links |
 | `broken-link` | error | Page links to non-existent slug |
-| `empty-content` | warning | Page has no content |
+| `empty-content` | warning | Page's `content` is missing, `null`, or `""` (pure-whitespace content is **not** flagged — see note below) |
 | `no-tags` | info | Page has no tags |
 | `no-sources` | info | Page has no source references |
 | `missing-embeddings` | warning | Some pages lack vector embeddings |
 | `unreferenced-source` | info | Source not referenced by any page |
+
+> **Note on `empty-content`:** since v1.2.0 lint stops projecting the full `content` field on every page (it can be MBs each) and runs an `$exists: false` / `null` / `""` query instead. Pure-whitespace content (`"   \n"`) is therefore **not** detected — accepted tradeoff for capping the lint payload at metadata size. If you need that check, run a one-shot `db pages aggregate` query that materialises `content` for the few pages you care about.
 
 ### Log
 
@@ -312,7 +314,7 @@ When answering questions:
 
 | Collection | Type | Description |
 |------------|------|-------------|
-| `sources` | db | Raw source documents |
+| `sources` | db | Raw source documents (indexed on `title` unique) |
 | `pages` | db | Wiki pages (indexed on `slug` unique, `type`) |
 | `log` | db | Operation log |
 | `page_embeddings` | vec | Page vector embeddings |
