@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.0] - 2026-05-04
 
 ### Added
 - `Page.status?: string` — documents the lifecycle field already used by `wiki page list --status=...` (#11)
