@@ -73,6 +73,7 @@ interface WikiOptions {
   embeddingDim?: number;   // Vector dimension (default: 1536)
   metric?: "cosine" | "euclidean" | "dot";  // default: "cosine"
   quantize?: "float32" | "int8";            // default: "float32"
+  logMaxEntries?: number;                   // cap on db log; auto-trims past 1.5×
 }
 ```
 
@@ -202,9 +203,16 @@ wiki log [--last=20] [--type=ingest]
 
 # Add a custom log entry
 wiki log add '{"type":"note","summary":"Started research on topic X"}'
+
+# Trim the log to the N most recent entries (older ones are deleted)
+wiki log trim --keep=1000
 ```
 
-All wiki operations are automatically logged with timestamps.
+All wiki operations are automatically logged with timestamps. For long-running
+agents, set `WikiOptions.logMaxEntries` to enable opportunistic auto-trim — the
+plugin samples the log size after each command and trims back to the cap when
+the count exceeds 1.5× the cap. `wiki log trim --keep=N` is always available
+for explicit trims regardless of the option.
 
 ### Stats
 

@@ -6,6 +6,8 @@
 - `Page.status?: string` — documents the lifecycle field already used by `wiki page list --status=...` (#11)
 - `--limit` / `--offset` on `wiki source list`, `wiki page list`, `wiki page orphans`, and the default `wiki index` view (#7). Invalid values (negative, non-integer) are silently dropped — the call still succeeds with the unfiltered behaviour.
 - Lint now flags pages whose `content` field is missing entirely, in addition to `null` / `""`.
+- `wiki log trim --keep=N` — explicit log trim, removes all entries beyond the N most-recent (uses `_id`-based removal so concurrent writes with identical timestamps are handled correctly) (#9)
+- `WikiOptions.logMaxEntries` — when set, the plugin samples log size every 16 commands and opportunistically trims back to the cap when the count exceeds 1.5× the cap (#9)
 
 ### Fixed
 - `wikiInit`: errors from `vec create` are now propagated instead of being silently swallowed (#1)
@@ -22,7 +24,7 @@
 - `pageCreate` now initialises `content` to `""` when omitted, so the field is always present (matching `Page.content: string`).
 
 ### Tests
-- 24 new tests covering all the above (slug not-found, search/embed validation, pagination, orphans-by-query, lint perf, `wiki index --rebuild` correctness with corrupted `linked_from` (#10))
+- 32 new tests covering all the above (slug not-found, search/embed validation, pagination, orphans-by-query, lint perf, `wiki index --rebuild` correctness with corrupted `linked_from` (#10), log trim manual + opportunistic auto-trim)
 
 ## [1.1.3] - 2026-05-02
 
