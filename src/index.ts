@@ -105,6 +105,27 @@ const safeParseAny = (s: string | undefined): unknown => {
   try { return JSON.parse(s); } catch { return null; }
 };
 
+/** Build the trailing portion of a `db ... find` command for paginated calls.
+ *  Reads `--limit` / `--offset` from the wiki-level flag map and emits the
+ *  corresponding `--limit N --skip M` for `db`. Returns "" when neither is set
+ *  so existing call sites keep their unlimited behaviour by default.
+ *  Negative or non-integer values are dropped silently — db will reject them
+ *  if they slip through, but we'd rather not 500 a list call over a typo. */
+const paginationFlags = (flags: Map<string, string>): string => {
+  const parts: string[] = [];
+  const limit = flags.get("limit");
+  const offset = flags.get("offset") ?? flags.get("skip");
+  if (limit !== undefined) {
+    const n = Number(limit);
+    if (Number.isInteger(n) && n >= 0) parts.push(`--limit ${n}`);
+  }
+  if (offset !== undefined) {
+    const n = Number(offset);
+    if (Number.isInteger(n) && n >= 0) parts.push(`--skip ${n}`);
+  }
+  return parts.length ? " " + parts.join(" ") : "";
+};
+
 // ── Wiki Command ───────────────────────────────────────────
 // NOTE: this plugin assumes single-writer semantics. Concurrent
 // page creations with cross-links may produce inconsistent
@@ -159,7 +180,7 @@ function buildWikiCommand(defaults: InitDefaults): Command {
           case "list": return pageList(exec, flags);
           case "delete": return pageDelete(exec, positional[2]);
           case "rename": return pageRename(exec, positional[2], positional[3]);
-          case "orphans": return pageOrphans(exec);
+          case "orphans": return pageOrphans(exec, flags);
           default: return fail(2, "usage: wiki page <create|update|get|list|delete|rename|orphans> [...]");
         }
       }
@@ -250,7 +271,8 @@ async function sourceList(exec: Exec, flags: Map<string, string>): Promise<ExecR
   const status = flags.get("status");
   if (type) filter.type = type;
   if (status) filter.status = status;
-  return exec(`${dbCmd("sources", "find", filter)} --project title,type,status,ingested_at`);
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("sources", "find", filter)} --project title,type,status,ingested_at${pag}`);
 }
 
 async function sourceGet(exec: Exec, id?: string): Promise<ExecResult> {
@@ -305,6 +327,10 @@ async function pageCreate(exec: Exec, jsonArg: string): Promise<ExecResult> {
   doc.source_ids = doc.source_ids ?? [];
   doc.tags = doc.tags ?? [];
   doc.type = doc.type ?? "concept";
+  // Normalise content to "" when omitted so the field is always present.
+  // Page.content is typed as `string`, and lint's empty-content check can
+  // rely on a single equality query instead of needing $exists fallbacks.
+  doc.content = doc.content ?? "";
   doc.created_at = now();
   doc.updated_at = doc.created_at;
 
@@ -369,7 +395,8 @@ async function pageList(exec: Exec, flags: Map<string, string>): Promise<ExecRes
   if (type) filter.type = type;
   if (tag) filter.tags = { $contains: tag };
   if (status) filter.status = status;
-  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,tags,updated_at`);
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,tags,updated_at${pag}`);
 }
 
 async function pageDelete(exec: Exec, slug?: string): Promise<ExecResult> {
@@ -458,15 +485,13 @@ async function pageRename(exec: Exec, oldSlug?: string, newSlug?: string): Promi
   return ok(JSON.stringify({ old_slug: oldSlug, new_slug: newSlug }));
 }
 
-async function pageOrphans(exec: Exec): Promise<ExecResult> {
-  const r = await exec(`db pages find '{}' --project slug,title,type,linked_from,links_to`);
-  if (r.exitCode !== 0) return r;
-  const pages = (safeParseAny(r.stdout) as Array<Record<string, unknown>> | null) ?? [];
-  const orphans = pages.filter((p) => {
-    const lf = p.linked_from as string[] | undefined;
-    return !lf || lf.length === 0;
-  });
-  return ok(JSON.stringify(orphans));
+async function pageOrphans(exec: Exec, flags: Map<string, string>): Promise<ExecResult> {
+  // Push the orphan filter into the db query instead of loading every page
+  // and filtering in JS. pageCreate always initialises linked_from = [], but
+  // the $or covers legacy/imported data where the field may be missing/null.
+  const filter = { $or: [{ linked_from: null }, { linked_from: { $size: 0 } }] };
+  const pag = paginationFlags(flags);
+  return exec(`${dbCmd("pages", "find", filter)} --project slug,title,type,linked_from,links_to${pag}`);
 }
 
 // ── SEARCH ────────────────────────────────────────────────
@@ -540,7 +565,10 @@ async function wikiEmbed(exec: Exec, positional: string[], flags: Map<string, st
 async function wikiLint(exec: Exec): Promise<ExecResult> {
   const issues: LintIssue[] = [];
 
-  const allPagesR = await exec(`db pages find '{}' --project slug,title,type,links_to,linked_from,source_ids,tags,content`);
+  // Main pass: project everything *except* content. The content field
+  // can be MBs per page; lint never reads it, only checks emptiness.
+  // The empty-content check is delegated to a targeted query below.
+  const allPagesR = await exec(`db pages find '{}' --project slug,title,type,links_to,linked_from,source_ids,tags`);
   if (allPagesR.exitCode !== 0) return allPagesR;
   const pages = (safeParseAny(allPagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
   const slugSet = new Set(pages.map((p) => p.slug as string));
@@ -562,10 +590,6 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
       }
     }
 
-    if (!page.content || (page.content as string).trim().length === 0) {
-      issues.push({ type: "empty-content", severity: "warning", message: "Page has no content", slug });
-    }
-
     const tags = page.tags as string[] | undefined;
     if (!tags || tags.length === 0) {
       issues.push({ type: "no-tags", severity: "info", message: "Page has no tags", slug });
@@ -574,6 +598,29 @@ async function wikiLint(exec: Exec): Promise<ExecResult> {
     const sourceIds = page.source_ids as string[] | undefined;
     if ((!sourceIds || sourceIds.length === 0) && page.type !== "overview" && page.type !== "index") {
       issues.push({ type: "no-sources", severity: "info", message: "Page has no source references", slug });
+    }
+  }
+
+  // Targeted empty-content pass: a separate query that only returns the slugs
+  // whose content is null/missing/empty. Whitespace-only content slips
+  // through this filter — accepted tradeoff vs. shipping every page body
+  // through stdout. Detection of pure-whitespace can be added later via
+  // a server-side derived field if it ever matters.
+  const emptyR = await exec(
+    `${dbCmd("pages", "find", {
+      $or: [
+        { content: { $exists: false } },
+        { content: null },
+        { content: "" },
+      ],
+    })} --project slug`
+  );
+  if (emptyR.exitCode === 0) {
+    const empty = (safeParseAny(emptyR.stdout) as Array<{ slug?: string }> | null) ?? [];
+    for (const p of empty) {
+      if (typeof p.slug === "string") {
+        issues.push({ type: "empty-content", severity: "warning", message: "Page has no content", slug: p.slug });
+      }
     }
   }
 
@@ -709,8 +756,10 @@ async function wikiIndex(exec: Exec, flags: Map<string, string>): Promise<ExecRe
     return ok(JSON.stringify({ rebuilt: true, pages: pages.length }));
   }
 
-  // Default: list pages grouped by type
-  const pagesR = await exec(`db pages find '{}' --project slug,title,type,tags,updated_at --sort type:1`);
+  // Default: list pages grouped by type. Pagination only affects this view —
+  // --rebuild always processes every page (correctness > scalability there).
+  const pag = paginationFlags(flags);
+  const pagesR = await exec(`db pages find '{}' --project slug,title,type,tags,updated_at --sort type:1${pag}`);
   if (pagesR.exitCode !== 0) return pagesR;
   const pages = (safeParseAny(pagesR.stdout) as Array<Record<string, unknown>> | null) ?? [];
 

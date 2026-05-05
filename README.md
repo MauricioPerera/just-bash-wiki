@@ -100,8 +100,8 @@ Creates all collections and indexes. Safe to call multiple times — skips exist
 # Add a source document
 wiki source add '{"title":"...","type":"article","content":"...","url":"...","author":"..."}'
 
-# List sources (optionally filter by type or status)
-wiki source list [--type=article] [--status=raw]
+# List sources (optionally filter, paginate)
+wiki source list [--type=article] [--status=raw] [--limit=50] [--offset=0]
 
 # Get a source by ID
 wiki source get <id>
@@ -130,8 +130,8 @@ wiki page update <slug> '{"$set":{"content":"...","tags":["ai","updated"]}}'
 # Get a page by slug
 wiki page get <slug>
 
-# List pages with optional filters
-wiki page list [--type=concept] [--tag=ai] [--status=draft]
+# List pages with optional filters and pagination
+wiki page list [--type=concept] [--tag=ai] [--status=draft] [--limit=50] [--offset=0]
 
 # Delete a page (cleans up cross-references and embeddings)
 wiki page delete <slug>
@@ -139,8 +139,8 @@ wiki page delete <slug>
 # Rename a page (updates all cross-references and re-keys embedding)
 wiki page rename <old-slug> <new-slug>
 
-# Find pages with no inbound links
-wiki page orphans
+# Find pages with no inbound links (paginated)
+wiki page orphans [--limit=50] [--offset=0]
 ```
 
 **Page fields:** `_id` (auto-generated), `slug` (required, unique), `title` (required), `type`, `content`, `tags`, `links_to`, `source_ids`. Auto-managed: `linked_from`, `created_at`, `updated_at`.
@@ -217,10 +217,13 @@ Returns a comprehensive overview: page/source/log counts, pages grouped by type,
 ### Index
 
 ```bash
-wiki index
+wiki index [--limit=N] [--offset=M]
+wiki index --rebuild
 ```
 
-Returns all pages grouped by type with their slugs, titles, tags, and last update timestamps.
+Default: returns pages grouped by type with their slugs, titles, tags, and last update timestamps. `--limit` / `--offset` paginate this view.
+
+`--rebuild` re-derives all `linked_from` arrays from the `links_to` graph and ignores pagination flags (correctness over scalability).
 
 ## Direct Access to db and vec
 
